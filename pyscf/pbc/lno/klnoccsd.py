@@ -455,10 +455,11 @@ class KLNOCCSD(KLNO,LNOCCSD):
         if self.kwargs_imp is not None:
             mcc = mcc.set(**self.kwargs_imp)
 
+        kappa = self.kappa if (self.regmp2 or self.regmp2_cc) else None
         return impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris, log=log,
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
-                              max_las_size_ccsd_t=self._max_las_size_ccsd_t)
+                              max_las_size_ccsd_t=self._max_las_size_ccsd_t, kappa=kappa)
 
 class KLNOCCSD_T(KLNOCCSD):
     def __init__(self, *args, **kwargs):

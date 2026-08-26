@@ -42,28 +42,29 @@ from functools import reduce
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import __config__
+from pyscf.lno.regmp2 import kappa_factor
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_DEBUG_BLKSIZE', False)
 
 
-def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type):
+def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type, kappa=None):
     if dm_type == '1h':
-        dm = make_lo_rdm1_occ_1h(eris, moeocc, moevir, uocc)
+        dm = make_lo_rdm1_occ_1h(eris, moeocc, moevir, uocc, kappa=kappa)
     elif dm_type == '1p':
-        dm = make_lo_rdm1_occ_1p(eris, moeocc, moevir, uvir)
+        dm = make_lo_rdm1_occ_1p(eris, moeocc, moevir, uvir, kappa=kappa)
     elif dm_type == '2p':
-        dm = make_lo_rdm1_occ_2p(eris, moeocc, moevir, uvir)
+        dm = make_lo_rdm1_occ_2p(eris, moeocc, moevir, uvir, kappa=kappa)
     else:
         raise RuntimeError('Requested occ LNO type "%s" is unknown.' % dm_type)
     return dm
 
-def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type):
+def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type, kappa=None):
     if dm_type == '1p':
-        dm = make_lo_rdm1_vir_1p(eris, moeocc, moevir, uvir)
+        dm = make_lo_rdm1_vir_1p(eris, moeocc, moevir, uvir, kappa=kappa)
     elif dm_type == '1h':
-        dm = make_lo_rdm1_vir_1h(eris, moeocc, moevir, uocc)
+        dm = make_lo_rdm1_vir_1h(eris, moeocc, moevir, uocc, kappa=kappa)
     elif dm_type == '2h':
-        dm = make_lo_rdm1_vir_2h(eris, moeocc, moevir, uocc)
+        dm = make_lo_rdm1_vir_2h(eris, moeocc, moevir, uocc, kappa=kappa)
     else:
         raise RuntimeError('Requested vir LNO type "%s" is unknown.' % dm_type)
     return dm
@@ -100,7 +101,7 @@ def _mp2_rdm1_virblksize(nocc, nvir, naux, n1, n2, M, dsize):
     '''
     return _mp2_rdm1_occblksize(nvir, nocc, naux, n1, n2, M, dsize)
 
-def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
+def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True, kappa=None):
     r''' Occ-occ and vir-vir blocks of MP2 density matrix
 
         Math:
@@ -139,6 +140,8 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
                 ejv = eov[j0:j1]
             denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
             t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / denom
+            if kappa is not None:
+                t2ijvv *= kappa_factor(denom, kappa)
             jvL = None
             denom = None
             if with_occ:
@@ -152,7 +155,7 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
 
     return dmoo, dmvv
 
-def make_full_rdm1_occ(eris, moeocc, moevir):
+def make_full_rdm1_occ(eris, moeocc, moevir, kappa=None):
     r''' Occupied MP2 density matrix
 
         Math:
@@ -186,6 +189,8 @@ def make_full_rdm1_occ(eris, moeocc, moevir):
                 ejv = eov[j0:j1]
             denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
             t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / denom
+            if kappa is not None:
+                t2ijvv *= kappa_factor(denom, kappa)
             jvL = None
             denom = None
             dm[i0:i1,j0:j1]  = 4*lib.einsum('ikab,jkab->ij', np.conj(t2ijvv), t2ijvv)
@@ -195,7 +200,7 @@ def make_full_rdm1_occ(eris, moeocc, moevir):
 
     return dm
 
-def make_full_rdm1_vir(eris, moeocc, moevir):
+def make_full_rdm1_vir(eris, moeocc, moevir, kappa=None):
     r''' Virtual MP2 density matrix
 
         Math:
@@ -229,6 +234,8 @@ def make_full_rdm1_vir(eris, moeocc, moevir):
                 ejv = eov[j0:j1]
             eijvv = lib.direct_sum('ia+jb->ijab', eiv, ejv)
             t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / eijvv
+            if kappa is not None:
+                t2ijvv *= kappa_factor(eijvv, kappa)
             jvL = None
             eijvv = None
 
@@ -240,7 +247,7 @@ def make_full_rdm1_vir(eris, moeocc, moevir):
 
     return dm
 
-def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -281,6 +288,8 @@ def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u):
             eiv = eov[i0:i1]
             eiKvv = lib.direct_sum('ia+Kb->iKab', eiv, eKv)
             t2iKvv = np.conj(lib.einsum('iax,Kbx->iKab', ivL, KvL)) / eiKvv
+            if kappa is not None:
+                t2iKvv *= kappa_factor(eiKvv, kappa)
             ivL = None
             eiKvv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
@@ -291,6 +300,8 @@ def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u):
                     ejv = eov[j0:j1]
                     ejKvv = lib.direct_sum('ia+Kb->iKab', ejv, eKv)
                     t2jKvv = np.conj(lib.einsum('iax,Kbx->iKab', jvL, KvL)) / ejKvv
+                    if kappa is not None:
+                        t2jKvv *= kappa_factor(ejKvv, kappa)
                     jvL = None
                     ejKvv = None
 
@@ -303,7 +314,7 @@ def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_1p(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1p(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized particle
 
         Math:
@@ -345,6 +356,8 @@ def make_lo_rdm1_occ_1p(eris, moeocc, moevir, u):
 
             eooAb = lib.direct_sum('iA+jb->ijAb', eoA, eob)
             t2ooAb = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, obL)) / eooAb
+            if kappa is not None:
+                t2ooAb *= kappa_factor(eooAb, kappa)
             obL = None
             eooAb = None
 
@@ -358,7 +371,7 @@ def make_lo_rdm1_occ_1p(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_2p(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_2p(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized particles
 
         Math:
@@ -402,6 +415,8 @@ def make_lo_rdm1_occ_2p(eris, moeocc, moevir, u):
                 eoB = eoV[:,B0:B1]
             eooAB = lib.direct_sum('iA+jB->ijAB', eoA, eoB)
             t2ooAB = np.conj(lib.einsum('iAx,jBx->ijAB', oAL, oBL)) / eooAB
+            if kappa is not None:
+                t2ooAB *= kappa_factor(eooAB, kappa)
             oBL = None
             eooAB = None
 
@@ -413,7 +428,7 @@ def make_lo_rdm1_occ_2p(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u, kappa=None):
     r''' Virtual MP2 density matrix with one localized particle
 
         Math:
@@ -455,6 +470,8 @@ def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u):
             eoa = eov[:,a0:a1]
             eooAa = lib.direct_sum('iA+jb->ijAb', eoA, eoa)
             t2ooAa = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, oaL)) / eooAa
+            if kappa is not None:
+                t2ooAa *= kappa_factor(eooAa, kappa)
             oaL = None
             eooAa = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
@@ -465,6 +482,8 @@ def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u):
                     eob = eov[:,b0:b1]
                     eooAb = lib.direct_sum('iA+jb->ijAb', eoA, eob)
                     t2ooAb = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, obL)) / eooAb
+                    if kappa is not None:
+                        t2ooAb *= kappa_factor(eooAb, kappa)
                     obL = None
                     eooAb = None
 
@@ -477,7 +496,7 @@ def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1h(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1h(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -520,6 +539,8 @@ def make_lo_rdm1_vir_1h(eris, moeocc, moevir, u):
 
             eIjvv = lib.direct_sum('Ia+jb->Ijab', eIv, ejv)
             t2Ijvv = np.conj(lib.einsum('Iax,jbx->Ijab', IvL, jvL)) / eIjvv
+            if kappa is not None:
+                t2Ijvv *= kappa_factor(eIjvv, kappa)
             jvL = None
             eIjvv = None
 
@@ -533,7 +554,7 @@ def make_lo_rdm1_vir_1h(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_2h(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_2h(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized holes
 
         Math:
@@ -577,6 +598,8 @@ def make_lo_rdm1_vir_2h(eris, moeocc, moevir, u):
                 eJv = eOv[J0:J1]
             eIJvv = lib.direct_sum('Ia+Jb->IJab', eIv, eJv)
             t2IJvv = np.conj(lib.einsum('Iax,Jbx->IJab', IvL, JvL)) / eIJvv
+            if kappa is not None:
+                t2IJvv *= kappa_factor(eIJvv, kappa)
             JvL = None
             eIJvv = None
 

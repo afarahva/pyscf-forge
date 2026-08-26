@@ -28,6 +28,7 @@ from pyscf import mp
 
 from pyscf.lno import lno
 from pyscf.lno.make_lno_rdm1 import _mp2_rdm1_occblksize, DEBUG_BLKSIZE
+from pyscf.lno.regmp2 import kappa_factor
 
 einsum = lib.einsum
 
@@ -80,10 +81,11 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
     ####################
     if lno_type[0] == lno_type[1] == '1h':
         # NOTE: uvir_loc is not used in 1h/1h, so we pass None
+        kappa = mlno.kappa if (mlno.regmp2 or mlno.regmp2_lno) else None
         if getattr(mlno, 'with_df', None):
-            dmoo, dmvv = make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc_loc)
+            dmoo, dmvv = make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc_loc, kappa=kappa)
         else:
-            dmoo, dmvv = make_lo_rdm1_1h(eris, moeocc, moevir, uocc_loc)
+            dmoo, dmvv = make_lo_rdm1_1h(eris, moeocc, moevir, uocc_loc, kappa=kappa)
     else:
         raise NotImplementedError('Unsupported LNO type')
 
@@ -139,7 +141,7 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
     return orbfrag, frzfrag, uoccact_loc, frag_msg
 
 
-def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
+def make_lo_rdm1_1h(eris, moeocc, moevir, uocc, kappa=None):
     r'''
     Create unrestricted MP2 density matrix with one localized hole
 
@@ -244,6 +246,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
             # form t2_ovov-block
             denom_aa = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_a)
             t2aa_i = eris.get_ivov(u_a, K0, K1, i0, i1) / denom_aa
+            if kappa is not None:
+                t2aa_i *= kappa_factor(denom_aa, kappa)
             t2aa_i = t2aa_i - t2aa_i.transpose(0, 3, 2, 1)
             denom_aa = None
             eiv_a = None
@@ -258,6 +262,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
                     # form t2_ovov-block
                     denom_aa = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_a)
                     t2aa_j = eris.get_ivov(u_a, K0, K1, j0, j1) / denom_aa
+                    if kappa is not None:
+                        t2aa_j *= kappa_factor(denom_aa, kappa)
                     t2aa_j = t2aa_j - t2aa_j.transpose(0, 3, 2, 1)
                     denom_aa = None
                     ejv_a = None
@@ -285,6 +291,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
             # form t2_ovov-block
             denom_bb = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_b)
             t2bb_i = eris.get_IVOV(u_b, K0, K1, i0, i1) / denom_bb
+            if kappa is not None:
+                t2bb_i *= kappa_factor(denom_bb, kappa)
             t2bb_i = t2bb_i - t2bb_i.transpose(0, 3, 2, 1)
             denom_bb = None
             eiv_b = None
@@ -299,6 +307,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
                     # form t2_ovov-block
                     denom_bb = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_b)
                     t2bb_j = eris.get_IVOV(u_b, K0, K1, j0, j1) / denom_bb
+                    if kappa is not None:
+                        t2bb_j *= kappa_factor(denom_bb, kappa)
                     t2bb_j = t2bb_j - t2bb_j.transpose(0, 3, 2, 1)
                     denom_bb = None
                     ejv_b = None
@@ -325,6 +335,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
             # form t2_ovov-block
             denom_ba = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_a)
             t2ba_i = eris.get_IVov(u_b, K0, K1, i0, i1) / denom_ba
+            if kappa is not None:
+                t2ba_i *= kappa_factor(denom_ba, kappa)
             denom_ba = None
             eiv_a = None
 
@@ -338,6 +350,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
                     # form t2_ovov-block
                     denom_ba = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_a)
                     t2ba_j = eris.get_IVov(u_b, K0, K1, j0, j1) / denom_ba
+                    if kappa is not None:
+                        t2ba_j *= kappa_factor(denom_ba, kappa)
                     denom_ba = None
                     ejv_a = None
 
@@ -364,6 +378,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
             # form t2_ovov-block
             denom_ab = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_b)
             t2ab_i = eris.get_ivOV(u_a, K0, K1, i0, i1) / denom_ab
+            if kappa is not None:
+                t2ab_i *= kappa_factor(denom_ab, kappa)
             denom_ba = None
             eiv_b = None
 
@@ -377,6 +393,8 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
                     # form t2_ovov-block
                     denom_ab = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_b)
                     t2ab_j = eris.get_ivOV(u_a, K0, K1, j0, j1) / denom_ab
+                    if kappa is not None:
+                        t2ab_j *= kappa_factor(denom_ab, kappa)
                     denom_ba = None
                     ejv_b = None
 
@@ -393,7 +411,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
     return [dmoo_a, dmoo_b], [dmvv_a, dmvv_b]
 
 
-def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
+def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc, kappa=None):
     r'''
     Create unrestricted MP2 density matrix with one localized hole
     Density-fitted version
@@ -504,6 +522,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
             # form t2-block
             denom_aa = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_a)
             t2aa_i = lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_a) / denom_aa
+            if kappa is not None:
+                t2aa_i *= kappa_factor(denom_aa, kappa)
             t2aa_i = t2aa_i - t2aa_i.transpose(0, 3, 2, 1)
             denom_aa = None
             ivL_a = None
@@ -521,6 +541,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
                     denom_aa = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_a)
                     t2aa_j = lib.einsum(
                         'Kax,jbx->Kajb', KvL_a, jvL_a) / denom_aa
+                    if kappa is not None:
+                        t2aa_j *= kappa_factor(denom_aa, kappa)
                     t2aa_j = t2aa_j - t2aa_j.transpose(0, 3, 2, 1)
                     denom_aa = None
                     jvL_a = None
@@ -552,6 +574,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
             # form t2-block
             denom_bb = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_b)
             t2bb_i = lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_b) / denom_bb
+            if kappa is not None:
+                t2bb_i *= kappa_factor(denom_bb, kappa)
             t2bb_i = t2bb_i - t2bb_i.transpose(0, 3, 2, 1)
             denom_bb = None
             ivL_b = None
@@ -569,6 +593,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
                     denom_bb = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_b)
                     t2bb_j = lib.einsum(
                         'Kax,jbx->Kajb', KvL_b, jvL_b) / denom_bb
+                    if kappa is not None:
+                        t2bb_j *= kappa_factor(denom_bb, kappa)
                     t2bb_j = t2bb_j - t2bb_j.transpose(0, 3, 2, 1)
                     denom_bb = None
                     jvL_b = None
@@ -600,6 +626,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
             # form t2-block
             denom_ba = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_a)
             t2ba_i = lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_a) / denom_ba
+            if kappa is not None:
+                t2ba_i *= kappa_factor(denom_ba, kappa)
             ivL_a = None
             eiv_a = None
             denom_ba = None
@@ -617,6 +645,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
                     denom_ba = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_a)
                     t2ba_j = lib.einsum(
                         'Kax,jbx->Kajb', KvL_b, jvL_a) / denom_ba
+                    if kappa is not None:
+                        t2ba_j *= kappa_factor(denom_ba, kappa)
                     jvL_a = None
                     ejv_a = None
                     denom_ba = None
@@ -648,6 +678,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
             # form t2-block
             denom_ab = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_b)
             t2ab_i = lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_b) / denom_ab
+            if kappa is not None:
+                t2ab_i *= kappa_factor(denom_ab, kappa)
             ivL_b = None
             eiv_b = None
             denom_ba = None
@@ -664,6 +696,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
                     denom_ab = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_b)
                     t2ab_j = lib.einsum(
                         'Kax,jbx->Kajb', KvL_a, jvL_b) / denom_ab
+                    if kappa is not None:
+                        t2ab_j *= kappa_factor(denom_ab, kappa)
                     jvL_b = None
                     ejv_b = None
                     denom_ba = None

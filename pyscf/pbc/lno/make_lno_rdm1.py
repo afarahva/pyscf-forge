@@ -25,50 +25,51 @@ from pyscf.lib import logger
 from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import subspace_eigh, _mp2_rdm1_occblksize, _mp2_rdm1_virblksize
+from pyscf.lno.regmp2 import kappa_factor
 from pyscf.pbc.lno.tools import zdotCNtoR
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_k2s_DEBUG_BLKSIZE', False)
 
 
-def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type):
+def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type, kappa=None):
     isreal = eris.dtype == np.float64
     if dm_type == '1h':
         if isreal:
-            dm = make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, uocc, kappa=kappa)
         else:
-            dm = make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, uocc, kappa=kappa)
     elif dm_type == '1p':
         if isreal:
-            dm = make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, uvir, kappa=kappa)
         else:
-            dm = make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, uvir, kappa=kappa)
     elif dm_type == '2p':
         if isreal:
-            dm = make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, uvir, kappa=kappa)
         else:
-            dm = make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, uvir, kappa=kappa)
     else:
         raise RuntimeError('Requested occ LNO type "%s" is unknown.' % dm_type)
     dm = _check_dm_imag(eris, dm)
     return dm
 
-def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type):
+def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type, kappa=None):
     isreal = eris.dtype == np.float64
     if dm_type == '1p':
         if isreal:
-            dm = make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, uvir, kappa=kappa)
         else:
-            dm = make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, uvir)
+            dm = make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, uvir, kappa=kappa)
     elif dm_type == '1h':
         if isreal:
-            dm = make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, uocc, kappa=kappa)
         else:
-            dm = make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, uocc, kappa=kappa)
     elif dm_type == '2h':
         if isreal:
-            dm = make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, uocc, kappa=kappa)
         else:
-            dm = make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, uocc)
+            dm = make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, uocc, kappa=kappa)
     else:
         raise RuntimeError('Requested vir LNO type "%s" is unknown.' % dm_type)
     dm = _check_dm_imag(eris, dm)
@@ -76,7 +77,7 @@ def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type):
 
 ''' make lo rdm1 for real orbitals
 '''
-def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
+def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True, kappa=None):
     r''' Occ-occ and vir-vir blocks of MP2 density matrix
 
         Math:
@@ -124,6 +125,8 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
             zdotCNtoR(ivLR, ivLI, jvLR.T, jvLI.T, cR=t2ijvv)
             t2ijvv = t2ijvv.reshape(*denom.shape)
             t2ijvv /= denom
+            if kappa is not None:
+                t2ijvv *= kappa_factor(denom, kappa)
             jvLR = jvLI = None
             denom = None
             if with_occ:
@@ -138,7 +141,7 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
 
     return dmoo, dmvv
 
-def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -190,6 +193,8 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
             zdotCNtoR(ivLR, ivLI, KvLR.T, KvLI.T, cR=t2ivKv)
             t2ivKv = t2ivKv.reshape(*eivKv.shape)
             t2ivKv /= eivKv
+            if kappa is not None:
+                t2ivKv *= kappa_factor(eivKv, kappa)
             ivLR = ivLI = None
             eivKv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
@@ -205,6 +210,8 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
                     zdotCNtoR(jvLR, jvLI, KvLR.T, KvLI.T, cR=t2jvKv)
                     t2jvKv = t2jvKv.reshape(*ejvKv.shape)
                     t2jvKv /= ejvKv
+                    if kappa is not None:
+                        t2jvKv *= kappa_factor(ejvKv, kappa)
                     jvLR = jvLI = None
                     ejvKv = None
 
@@ -218,7 +225,7 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized particle
 
         Math:
@@ -270,6 +277,8 @@ def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
             zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
             t2oAob = t2oAob.reshape(*eoAob.shape)
             t2oAob /= eoAob
+            if kappa is not None:
+                t2oAob *= kappa_factor(eoAob, kappa)
             eoAob = None
             obLR = obLI = None
 
@@ -284,7 +293,7 @@ def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized particles
 
         Math:
@@ -340,6 +349,8 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
             zdotCNtoR(oALR, oALI, oBLR.T, oBLI.T, cR=t2oAoB)
             t2oAoB = t2oAoB.reshape(*eoAoB.shape)
             t2oAoB /= eoAoB
+            if kappa is not None:
+                t2oAoB *= kappa_factor(eoAoB, kappa)
             eoAoB = None
             oBLR = oBLI = None
 
@@ -352,7 +363,7 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u, kappa=None):
     r''' Virtual MP2 density matrix with one localized particle
 
         Math:
@@ -405,6 +416,8 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
             zdotCNtoR(oALR, oALI, oaLR.T, oaLI.T, cR=t2oAoa)
             t2oAoa = t2oAoa.reshape(*eoAoa.shape)
             t2oAoa /= eoAoa
+            if kappa is not None:
+                t2oAoa *= kappa_factor(eoAoa, kappa)
             eoAoa = None
             oaLR = oaLI = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
@@ -420,6 +433,8 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
                     zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
                     t2oAob = t2oAob.reshape(*eoAob.shape)
                     t2oAob /= eoAob
+                    if kappa is not None:
+                        t2oAob *= kappa_factor(eoAob, kappa)
                     eoAob = None
                     obLR = obLI = None
 
@@ -433,7 +448,7 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -485,6 +500,8 @@ def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
             zdotCNtoR(IvLR, IvLI, jvLR.T, jvLI.T, cR=t2Ivjv)
             t2Ivjv = t2Ivjv.reshape(*eIvjv.shape)
             t2Ivjv /= eIvjv
+            if kappa is not None:
+                t2Ivjv *= kappa_factor(eIvjv, kappa)
             eIvjv = None
             jvLR = jvLI = None
 
@@ -499,7 +516,7 @@ def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized holes
 
         Math:
@@ -555,6 +572,8 @@ def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
             zdotCNtoR(IvLR, IvLI, JvLR.T, JvLI.T, cR=t2IvJv)
             t2IvJv = t2IvJv.reshape(*eIvJv.shape)
             t2IvJv /= eIvJv
+            if kappa is not None:
+                t2IvJv *= kappa_factor(eIvJv, kappa)
             eIvJv = None
             JvLR = JvLI = None
 
@@ -570,7 +589,7 @@ def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
 
 ''' make lo rdm1 for complex orbitals
 '''
-def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -615,6 +634,8 @@ def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
                 t2iKvv += lib.einsum('iax,Kbx->iKab', eris.get_occ_blk(q1,i0,i1), KvL[q2])
             conj_(t2iKvv)
             t2iKvv /= eiKvv
+            if kappa is not None:
+                t2iKvv *= kappa_factor(eiKvv, kappa)
             eiKvv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
                 if jbatch == ibatch:
@@ -627,6 +648,8 @@ def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
                         t2jKvv += lib.einsum('iax,Kbx->iKab', eris.get_occ_blk(q1,j0,j1), KvL[q2])
                     conj_(t2jKvv)
                     t2jKvv /= ejKvv
+                    if kappa is not None:
+                        t2jKvv *= kappa_factor(ejKvv, kappa)
                     ejKvv = None
 
                 dm[i0:i1,j0:j1] -= 4 * lib.einsum('iKab,jKab->ij', np.conj(t2iKvv), t2jKvv)
@@ -638,7 +661,7 @@ def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized particle
 
         Math:
@@ -683,6 +706,8 @@ def make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, u):
                 t2ooAb += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,b0,b1))
             conj_(t2ooAb)
             t2ooAb /= eooAb
+            if kappa is not None:
+                t2ooAb *= kappa_factor(eooAb, kappa)
             eooAb = None
 
             dm -= 2 * lib.einsum('ikAb,jkAb->ij', np.conj(t2ooAb), t2ooAb)
@@ -695,7 +720,7 @@ def make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized particles
 
         Math:
@@ -747,6 +772,8 @@ def make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, u):
                     t2ooAB += lib.einsum('iAx,jBx->ijAB', oAL[q1], eris.xform_vir(q2, u[:,B0:B1]))
             conj_(t2ooAB)
             t2ooAB /= eooAB
+            if kappa is not None:
+                t2ooAB *= kappa_factor(eooAB, kappa)
 
             eooAB = None
 
@@ -758,7 +785,7 @@ def make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Virtual MP2 density matrix with one localized particle
 
         Math:
@@ -804,6 +831,8 @@ def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
                 t2ooAa += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,a0,a1))
             conj_(t2ooAa)
             t2ooAa /= eooAa
+            if kappa is not None:
+                t2ooAa *= kappa_factor(eooAa, kappa)
             eooAa = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
                 if abatch == bbatch:
@@ -816,6 +845,8 @@ def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
                         t2ooAb += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,b0,b1))
                     conj_(t2ooAb)
                     t2ooAb /= eooAb
+                    if kappa is not None:
+                        t2ooAb *= kappa_factor(eooAb, kappa)
                     eooAb = None
 
                 dm[a0:a1,b0:b1] += 4 * lib.einsum('ijAa,ijAb->ab', t2ooAa, np.conj(t2ooAb))
@@ -827,7 +858,7 @@ def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -873,6 +904,8 @@ def make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, u):
                 t2Ijvv += lib.einsum('Iax,jbx->Ijab', IvL[q1], eris.get_occ_blk(q2,j0,j1))
             conj_(t2Ijvv)
             t2Ijvv /= eIjvv
+            if kappa is not None:
+                t2Ijvv *= kappa_factor(eIjvv, kappa)
             eIjvv = None
 
             dm += 2 * lib.einsum('Ijac,Ijbc->ab', t2Ijvv, np.conj(t2Ijvv))
@@ -885,7 +918,7 @@ def make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u):
+def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u, kappa=None):
     r''' Occupied MP2 density matrix with two localized holes
 
         Math:
@@ -937,6 +970,8 @@ def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u):
                     t2IJvv += lib.einsum('Iax,Jbx->IJab', IvL[q1], eris.xform_occ(q2, u[:,J0:J1]))
             conj_(t2IJvv)
             t2IJvv /= eIJvv
+            if kappa is not None:
+                t2IJvv *= kappa_factor(eIJvv, kappa)
 
             eIJvv = None
 

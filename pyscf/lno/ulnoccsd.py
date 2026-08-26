@@ -26,6 +26,7 @@ from pyscf.mp.ump2 import get_frozen_mask
 from pyscf.lno.ulno import ULNO
 from pyscf.lno import lnoccsd
 from pyscf.lno.lnoccsd import LNOCCSD, LNOCCSD_T
+from pyscf.lno.regmp2 import kappa_factor
 
 einsum = lib.einsum
 
@@ -322,7 +323,7 @@ def _make_df_eris_outcore(mycc, mo_coeff=None):
 
 def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                    ccsd_t=False, log=None, verbose_imp=None,
-                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000):
+                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None):
 
     log = logger.new_logger(mcc if log is None else log)
     cput1 = (logger.process_clock(), logger.perf_counter())
@@ -364,8 +365,27 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
         cput1 = log.timer_debug1('imp sol - eri    ', *cput1)
         # MP2 fragment energy
         t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
+        if kappa is None:
+            t2_ene = t2
+        else:
+            # kappa-MP2: regularize the init MP2 amplitudes (kappa-t2) used to
+            # seed the CCSD. Each amplitude block carries a single factor g; the
+            # fragment energy, being quadratic in the amplitudes, carries g**2.
+            mo_ea, mo_eb = imp_eris.mo_energy
+            eia_a = mo_ea[:nactocca,None] - mo_ea[None,nactocca:]
+            eia_b = mo_eb[:nactoccb,None] - mo_eb[None,nactoccb:]
+            gaa = kappa_factor(lib.direct_sum('ia,jb->ijab', eia_a, eia_a), kappa)
+            gab = kappa_factor(lib.direct_sum('ia,jb->ijab', eia_a, eia_b), kappa)
+            gbb = kappa_factor(lib.direct_sum('ia,jb->ijab', eia_b, eia_b), kappa)
+            t2aa, t2ab, t2bb = t2
+            t2aa *= gaa
+            t2ab *= gab
+            t2bb *= gbb
+            t2 = (t2aa, t2ab, t2bb)
+            t2_ene = (t2aa*gaa, t2ab*gab, t2bb*gbb)
         cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-        elcorr_pt2 = get_fragment_energy(imp_eris, t1, t2, prjlo)
+        elcorr_pt2 = get_fragment_energy(imp_eris, t1, t2_ene, prjlo)
+        t2_ene = None
         cput1 = log.timer_debug1('imp sol - mp2 ene', *cput1)
         # CCSD fragment energy
         t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
@@ -461,10 +481,11 @@ class ULNOCCSD(ULNO, LNOCCSD):
         if self.kwargs_imp is not None:
             mcc = mcc.set(**self.kwargs_imp)
 
+        kappa = self.kappa if (self.regmp2 or self.regmp2_cc) else None
         return impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris, log=log,
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
-                              max_las_size_ccsd_t=self._max_las_size_ccsd_t)
+                              max_las_size_ccsd_t=self._max_las_size_ccsd_t, kappa=kappa)
 
 
 class ULNOCCSD_T(ULNOCCSD, LNOCCSD_T):

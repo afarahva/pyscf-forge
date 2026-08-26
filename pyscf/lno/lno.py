@@ -372,6 +372,12 @@ class LNO(lib.StreamObject):
         self.prune_lno_basis = False  # whether or not to use domains
         self.lno_basis_thresh = 0.02  # default Boughton-Pulay parameter
 
+        # regularized mp2
+        self.regmp2_lno = False # kappa-reg amplitudes in the LNO density matrices only
+        self.regmp2_cc = False  # kappa-reg amplitudes in the MP2 energy / CC guess only
+        self.regmp2 = False     # kappa-reg everywhere; supersedes the two above
+        self.kappa = 1.1        # kappa-MP2 regularization strength
+
         # df eri
         self._ovL = None
         self._ovL_to_save = None
@@ -456,6 +462,9 @@ class LNO(lib.StreamObject):
         log.info('_ovL_to_save = %s', self._ovL_to_save)
         log.info('force_outcore_ao2mo = %s', self.force_outcore_ao2mo)
         log.info('_match_oldcode = %s', self._match_oldcode)
+        if self.regmp2 or self.regmp2_lno or self.regmp2_cc:
+            log.info('regmp2 = %s  regmp2_lno = %s  regmp2_cc = %s  kappa = %s',
+                     self.regmp2, self.regmp2_lno, self.regmp2_cc, self.kappa)
         return self
 
     def kernel(self, eris=None):
@@ -536,10 +545,14 @@ class LNO(lib.StreamObject):
             return eris
 
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type)
+        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
+                                kappa=kappa)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type)
+        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
+                                kappa=kappa)
 
     def _precompute(self, *args, **kwargs):
         pass

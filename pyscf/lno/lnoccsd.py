@@ -35,6 +35,7 @@ from pyscf.lib import logger
 from pyscf import lib
 
 from pyscf.lno import LNO
+from pyscf.lno.regmp2 import kappa_factor
 
 _fdot = np.dot
 fdot = lambda *args: reduce(_fdot, args)
@@ -478,7 +479,7 @@ class MODIFIED_DFCCSD_complex:
 '''
 def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                    ccsd_t=False, log=None, verbose_imp=None,
-                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000):
+                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None):
     r''' Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -539,8 +540,20 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
 
             # MP2 fragment energy
             t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
+            if kappa is None:
+                t2_ene = t2
+            else:
+                # kappa-MP2: regularize the init MP2 amplitudes (kappa-t2) used to
+                # seed the CCSD. The amplitude carries a single factor g; the
+                # fragment energy, being quadratic in the amplitude, carries g**2.
+                mo_e = imp_eris.mo_energy
+                eia = mo_e[:nactocc,None] - mo_e[None,nactocc:]
+                g = kappa_factor(lib.direct_sum('ia,jb->ijab', eia, eia), kappa)
+                t2 *= g
+                t2_ene = t2 * g
             cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-            elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
+            elcorr_pt2 = get_fragment_energy(oovv, t2_ene, uocc_loc).real
+            t2_ene = None
             cput1 = log.timer_debug1('imp sol - mp2 ene', *cput1)
 
             # CCSD fragment energy
@@ -676,10 +689,11 @@ class LNOCCSD(LNO):
         if self.kwargs_imp is not None:
             mcc = mcc.set(**self.kwargs_imp)
 
+        kappa = self.kappa if (self.regmp2 or self.regmp2_cc) else None
         return impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris, log=log,
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
-                              max_las_size_ccsd_t=self._max_las_size_ccsd_t)
+                              max_las_size_ccsd_t=self._max_las_size_ccsd_t, kappa=kappa)
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by `impurity_solve` collected in `frag_res`.
