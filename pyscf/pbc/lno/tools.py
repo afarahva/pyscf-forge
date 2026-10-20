@@ -13,6 +13,20 @@ from pyscf import __config__
 MINAO = getattr(__config__, 'lo_iao_minao', 'minao')
 
 
+def is_trs_kmesh(cell, kpts):
+    r''' Whether the k-point mesh is closed under k -> -k (up to a reciprocal lattice vector).
+
+    This holds for Gamma-centered meshes and for meshes shifted by half a grid spacing along
+    any subset of the reciprocal axes (e.g., even Monkhorst-Pack meshes). The BvK supercell
+    twist k_s then satisfies 2 k_s = 0 (mod supercell reciprocal lattice), and the supercell
+    orbitals and integrals from the k2s transformation are real.
+    '''
+    x = cell.get_scaled_kpts(np.asarray(kpts).reshape(-1,3))
+    x2 = x[:,None,:] + x[None,:,:]
+    hasminus = (abs(x2 - x2.round()).sum(axis=-1) < KPT_DIFF_TOL).any(axis=1)
+    return bool(hasminus.all())
+
+
 def k2s_scf(kmf, fock_imag_tol=1e-6):
     from pyscf.scf.hf import eig
     from pyscf.pbc import scf
@@ -43,9 +57,9 @@ def k2s_scf(kmf, fock_imag_tol=1e-6):
     ksc = [np.dot(s1e,mo_coeff) for s1e,mo_coeff in zip(ks1e,kmo_coeff)]
     kfock = np.asarray([np.dot(sc*moe,sc.T.conj()) for sc,moe in zip(ksc,kmo_energy)])
 
-    s1e = _k2s_aoint(ks1e, kpts, phase, 's1e')
-    h1e = _k2s_aoint(kh1e, kpts, phase, 'h1e')
-    fock = _k2s_aoint(kfock, kpts, phase, 'fock')
+    s1e = _k2s_aoint(cell, ks1e, kpts, phase, 's1e')
+    h1e = _k2s_aoint(cell, kh1e, kpts, phase, 'h1e')
+    fock = _k2s_aoint(cell, kfock, kpts, phase, 'fock')
 
     mo_energy, mo_coeff = eig(fock, s1e)
 
@@ -60,6 +74,9 @@ def k2s_scf(kmf, fock_imag_tol=1e-6):
             f"{dfobj.__class__.__module__}.{dfobj.__class__.__name__}"
         )
 
+    # LNO removes the Madelung shift from the occupied orbital energies iff mf.exxdiv is
+    # 'ewald', so it must reflect whether kmf.mo_energy includes it.
+    mf.exxdiv = kmf.exxdiv
     mf.mo_coeff = mo_coeff
     mf.mo_energy = mo_energy
     mf.mo_occ = mf.get_occ()
@@ -150,16 +167,16 @@ def k2s_aoint(cell, kpts, kA, name='aoint', phase=None):
     if phase is None:
         kmesh = k2gamma.kpts_to_kmesh(cell, kpts-kpts[0])
         scell, phase = k2gamma.get_phase(cell, kpts, kmesh)
-    return _k2s_aoint(kA, kpts, phase)
+    return _k2s_aoint(cell, kA, kpts, phase, name)
 
-def _k2s_aoint(kA, kpts, phase, name='aoint'):
+def _k2s_aoint(cell, kA, kpts, phase, name='aoint'):
     Ncell = phase.shape[0]
     nao = kA[0].shape[0]
     Nao = Ncell*nao
 
     sA = lib.einsum('Rk,kpq,Sk->RpSq', phase, np.asarray(kA), phase.conj()).reshape(Nao,Nao)
 
-    if gamma_point(kpts[0]):
+    if is_trs_kmesh(cell, kpts):
         sAi = abs(sA.imag).max()
         if sAi > 1e-4:
             log = lib.logger.Logger(sys.stdout, 6)
@@ -180,8 +197,10 @@ class K2SDF(lib.StreamObject):
         self.kikj_by_q = get_kikj_by_q(self.cell, self.kpts, self.qpts)
         self.qconserv = get_qconserv(self.cell, self.qpts)
 
+        self.trs_kmesh = is_trs_kmesh(self.cell, self.kpts)
+
         nqpts = len(self.qpts)
-        if gamma_point(self.kpts[0]) and time_reversal_symmetry:    # time reversal symmetry
+        if self.trs_kmesh and time_reversal_symmetry:    # time reversal symmetry
             find = np.zeros(len(self.qpts), dtype=bool)
             ibz2bz = []
             qpts_ibz_weights = []
@@ -279,9 +298,10 @@ class K2SDF(lib.StreamObject):
 
         Explanation:
             While the 3c DF integrals is complex due to using kpts, the resulting
-            ERI can be real if (a) kpt mesh is Gamma-inclusive and (b) MOs are real.
+            ERI can be real if (a) kpt mesh is closed under k -> -k (Gamma-inclusive or
+            half-shifted) and (b) MOs are real.
         '''
-        return _guess_dtype_dsize(self.kpts, *arrs)
+        return _guess_dtype_dsize(self.trs_kmesh, *arrs)
 
 def get_kikj_by_q(cell, kpts, qpts):
     ''' Find map such that dot(qpts[q] - kpts[ki] + kpts[kj], alat) = 2pi * n
@@ -338,8 +358,8 @@ def zdotNNtoR(aR, aI, bR, bI, alpha=1, cR=None, beta=0):
     cR = lib.ddot(aI, bI, -alpha, cR, 1  )
     return cR
 
-def _guess_dtype_dsize(kpts, *arrs):
-    dtype = np.float64 if gamma_point(kpts[0]) else np.complex128
+def _guess_dtype_dsize(trs_kmesh, *arrs):
+    dtype = np.float64 if trs_kmesh else np.complex128
     dtype = np.result_type(dtype, *arrs)
     dsize = 8 if dtype == np.float64 else 16
     return dtype, dsize
@@ -361,7 +381,8 @@ def sort_orb_by_cell(scell, lo_coeff, Ncell, s=None, kpt=np.zeros(3), pop_method
                 s = scell.pbc_intor('int1e_ovlp', kpts=kpt)
             where `kpt` needs to be specified (vide infra).
         kpt (np.ndarray):
-            k-point for calculating the AO overlap matrix. Default is Gamma point.
+            k-point for calculating the AO overlap matrix. Default is Gamma point. For a
+            shifted k-point mesh, pass the supercell twist kpts[0] (or `s` directly).
         pop_method (str):
             Population method for assigning LOs to cells. Default is 'meta-lowdin'.
         Q_tol (float):
@@ -451,7 +472,7 @@ def k2s_iao(cell, kocc_coeff, kpts, minao=MINAO, orth=False, s1e=None):
     iao_coeff = lib.einsum('Rk,kpq,Sk->RpSq', phase, kiao_coeff,
                            phase.conj()).reshape(nkpts*nao,nkpts*niao)
 
-    if gamma_point(kpts[0]):
+    if is_trs_kmesh(cell, kpts):
         iao_coeff_imag = abs(iao_coeff.imag).max()
         if iao_coeff_imag > 1e-10:
             log.warn('Discard large imag part in k2s_iao: %6.2e.', iao_coeff_imag)

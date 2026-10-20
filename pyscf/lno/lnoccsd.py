@@ -36,6 +36,7 @@ from pyscf import lib
 
 from pyscf.lno import LNO
 from pyscf.lno.regmp2 import kappa_factor
+from pyscf.lno.tools import df_loop
 
 _fdot = np.dot
 fdot = lambda *args: reduce(_fdot, args)
@@ -297,7 +298,7 @@ def _make_df_eris_outcore(mycc, mo_coeff=None):
     ijslice = (0, nmo, 0, nmo)
     Lpq = None
     p1 = 0
-    for eri1 in mycc._scf.with_df.loop():
+    for eri1 in df_loop(mycc._scf.with_df):
         Lpq = _ao2mo.nr_e2(eri1, mo_coeff, ijslice, aosym='s2', out=Lpq).reshape(-1,nmo,nmo)
         p0, p1 = p1, p1 + Lpq.shape[0]
         Loo[p0:p1] = Lpq[:,:nocc,:nocc]
@@ -426,7 +427,7 @@ def _make_df_eris(cc, mo_coeff=None):
     ijslice = (0, nmo, 0, nmo)
     p1 = 0
     Lpq = None
-    for k, eri1 in enumerate(with_df.loop()):
+    for k, eri1 in enumerate(df_loop(with_df)):
         Lpq = _ao2mo.nr_e2(eri1, mo, ijslice, aosym='s2', mosym='s1', out=Lpq)
         p0, p1 = p1, p1 + Lpq.shape[0]
         Lpq = Lpq.reshape(p1-p0,nmo,nmo)

@@ -37,11 +37,10 @@ import h5py
 from pyscf.lib import logger
 from pyscf import lib
 from pyscf.pbc.df.df import _load3c
-from pyscf.pbc.lib.kpts_helper import gamma_point
 from pyscf import __config__
 
 from pyscf.lno import LNO
-from pyscf.pbc.lno.tools import K2SDF, k2s_scf
+from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh
 from pyscf.pbc.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
 
 einsum = lib.einsum
@@ -102,7 +101,8 @@ class KLNO(LNO):
             mem_now = self.max_memory - lib.current_memory()[0]
             nkpts = len(self.kpts)
             naux = self.with_df.get_naoaux()
-            nk = nkpts//2+nkpts%2 if gamma_point(self.kpts[0]) and np.isrealobj(orbocc) else nkpts
+            trs = is_trs_kmesh(self.unit_cell, self.kpts) and np.isrealobj(orbocc)
+            nk = nkpts//2+nkpts%2 if trs else nkpts
             mem_df = nk*nocc*nvir*naux*dsize/1024**2.
             log.debug('ao2mo est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
             if ( (self._ovL_to_save is not None) or (self._ovL is not None) or
@@ -130,7 +130,7 @@ class KLNO(LNO):
 
 
 def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):
-    if gamma_point(with_df.kpts[0]) and np.isrealobj(orbocc.dtype):
+    if is_trs_kmesh(with_df.cell, with_df.kpts) and np.isrealobj(orbocc.dtype):
         _ERIS = _KLNODFINCOREERIS_REAL
     else:
         _ERIS = _KLNODFINCOREERIS_COMPLEX
@@ -138,7 +138,7 @@ def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=
 
 def _KLNODFOUTCOREERIS(with_df, orbocc, orbvir, max_memory, ovL=None, ovL_to_save=None,
                        verbose=None, stdout=None):
-    if gamma_point(with_df.kpts[0]) and np.isrealobj(orbocc.dtype):
+    if is_trs_kmesh(with_df.cell, with_df.kpts) and np.isrealobj(orbocc.dtype):
         _ERIS = _KLNODFOUTCOREERIS_REAL
     else:
         _ERIS = _KLNODFOUTCOREERIS_COMPLEX

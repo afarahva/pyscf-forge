@@ -21,7 +21,7 @@ from pyscf.pbc import gto, scf, tools as pbctools
 from pyscf.lno import LNOCCSD, LNOCCSD_T
 from pyscf.pbc.lno import KLNOCCSD, KLNOCCSD_T
 from pyscf.lno.tools import autofrag_iao
-from pyscf.pbc.lno.tools import k2s_scf, k2s_iao
+from pyscf.pbc.lno.tools import k2s_scf, k2s_iao, is_trs_kmesh
 from pyscf import lo
 
 
@@ -112,6 +112,96 @@ class WaterDimer(unittest.TestCase):
             self.assertAlmostEqual(kemp2, semp2, 6)
             self.assertAlmostEqual(keccsd, seccsd, 6)
             # self.assertAlmostEqual(keccsd_t, seccsd_t, 6)
+
+
+class ShiftedKmesh(unittest.TestCase):
+    ''' KLNO on k-point meshes closed under k -> -k but without Gamma (half-shifted along
+        some reciprocal axes). The supercell is then at a time-reversal invariant twist with
+        real orbitals, and KLNO-CCSD(T) with all LNOs kept must equal canonical KCCSD(T).
+    '''
+    @classmethod
+    def setUpClass(cls):
+        cell = gto.Cell()
+        cell.verbose = 0
+        cell.atom = 'H 0 0 0; H 0 0 0.74; H 1.85 0 0; H 1.85 0 0.74'
+        cell.a = np.diag([3.7, 4.0, 4.0])
+        cell.basis = '6-31g'
+        cell.precision = 1e-10
+        cell.build()
+        cls.cell = cell
+
+    @classmethod
+    def tearDownClass(cls):
+        del cls.cell
+
+    def _kmf(self, kmesh, scaled_center, exxdiv='ewald'):
+        kpts = self.cell.make_kpts(kmesh, scaled_center=scaled_center)
+        kmf = scf.KRHF(self.cell, kpts=kpts).density_fit()
+        kmf.exxdiv = exxdiv
+        return kmf.run(conv_tol=1e-11)
+
+    def _klno(self, kmf, smf=None, ccsd_t=True):
+        if smf is None: smf = k2s_scf(kmf)
+        kocc_coeff = [c[:,o>1e-6] for c,o in zip(kmf.mo_coeff, kmf.mo_occ)]
+        lo_coeff = k2s_iao(self.cell, kocc_coeff, kmf.kpts, minao='sto-3g', orth=True)
+        frag_lolist = autofrag_iao(lo.iao.reference_mol(self.cell, 'sto-3g'))
+        mcc = (KLNOCCSD_T if ccsd_t else KLNOCCSD)(kmf, lo_coeff, frag_lolist, mf=smf)
+        mcc.lno_thresh = [1e-100, 1e-100]
+        mcc.kwargs_imp = {'conv_tol': 1e-10, 'conv_tol_normt': 1e-8}
+        mcc.kernel()
+        return mcc, lo_coeff, frag_lolist
+
+    def test_is_trs_kmesh(self):
+        cell = self.cell
+        for kmesh, center, ref in (([2,2,1], [0,0,0], True),
+                                   ([2,2,1], [0.25,0.25,0], True),
+                                   ([3,1,1], [1/6,0,0], True),
+                                   ([2,2,1], [0.25,0,0], True),
+                                   ([2,1,1], [0.1,0,0], False)):
+            kpts = cell.make_kpts(kmesh, scaled_center=center)
+            self.assertEqual(is_trs_kmesh(cell, kpts), ref)
+
+    def test_k2s_scf_real(self):
+        kmf = self._kmf([2,1,1], [0.25,0,0], exxdiv=None)
+        smf = k2s_scf(kmf)
+        self.assertTrue(np.isrealobj(smf.mo_coeff))
+        self.assertTrue(np.isrealobj(smf.get_ovlp()))
+        s_twist = smf.cell.pbc_intor('int1e_ovlp', hermi=1, kpts=kmf.kpts[0])
+        self.assertAlmostEqual(abs(smf.get_ovlp() - s_twist).max(), 0, 9)
+        self.assertIsNone(smf.exxdiv)
+
+    def test_klnoccsd_t_canonical(self):
+        from pyscf.pbc import cc
+        from pyscf.pbc.cc import kccsd_t_rhf
+        for kmesh, center in (([2,1,1], [0.25,0,0]),
+                              ([3,1,1], [1/6,0,0])):
+            kmf = self._kmf(kmesh, center)
+            kcc = cc.KRCCSD(kmf).set(conv_tol=1e-10, conv_tol_normt=1e-8).run()
+            et = kccsd_t_rhf.kernel(kcc, kcc.ao2mo())
+            mcc = self._klno(kmf)[0]
+            self.assertAlmostEqual(mcc.e_corr_ccsd, kcc.e_corr, 7)
+            self.assertAlmostEqual(mcc.e_corr_ccsd_t, kcc.e_corr+et, 7)
+
+    def test_klnoccsd_t_matches_supercell(self):
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        smf = k2s_scf(kmf)
+        kmcc, lo_coeff, frag_lolist = self._klno(kmf, smf)
+        nkpts = len(kmf.kpts)
+        nlo = lo_coeff.shape[1] // nkpts
+        sfrag_lolist = [[r*nlo+i for i in f] for r in range(nkpts) for f in frag_lolist]
+        mcc = LNOCCSD_T(smf, lo_coeff, sfrag_lolist)
+        mcc.lno_thresh = [1e-100, 1e-100]
+        mcc.kwargs_imp = {'conv_tol': 1e-10, 'conv_tol_normt': 1e-8}
+        mcc.kernel()
+        self.assertAlmostEqual(kmcc.e_corr_ccsd, mcc.e_corr_ccsd/nkpts, 7)
+        self.assertAlmostEqual(kmcc.e_corr_ccsd_t, mcc.e_corr_ccsd_t/nkpts, 7)
+
+    def test_exxdiv_independent(self):
+        ''' The Madelung shift is removed from the k2s Fock iff it is in kmf.mo_energy. '''
+        ecc = [self._klno(self._kmf([2,1,1], [0.25,0,0], exxdiv=exxdiv),
+                          ccsd_t=False)[0].e_corr_ccsd
+               for exxdiv in ('ewald', None)]
+        self.assertAlmostEqual(ecc[0], ecc[1], 7)
 
 
 

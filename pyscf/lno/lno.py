@@ -43,6 +43,7 @@ from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
 from pyscf.lno import domain
+from pyscf.lno.tools import df_loop
 
 einsum = lib.einsum
 
@@ -707,7 +708,7 @@ def _init_mp_df_eris(with_df, occ_coeff, vir_coeff, max_memory, ovL=None, log=No
 
     if dtype == np.float64:
         def loop_df(blksize):
-            for Lpq in with_df.loop(blksize=blksize):
+            for Lpq in df_loop(with_df, blksize=blksize):
                 yield Lpq
                 Lpq = None
         def ao2mo_df(Lpq, mo, ijslice, out):

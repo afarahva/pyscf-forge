@@ -29,7 +29,6 @@
 
 import numpy as np
 
-from pyscf.pbc.lib.kpts_helper import gamma_point
 from pyscf import lib
 logger = lib.logger
 
@@ -41,7 +40,7 @@ import ctypes
 from pyscf.lno.lnoccsd import (LNOCCSD, MODIFIED_CCSD, MODIFIED_DFCCSD, _ChemistsERIs,
                                impurity_solve, get_maskact, _cp)
 from pyscf.pbc.lno.klno import KLNO
-from pyscf.pbc.lno.tools import K2SDF, zdotCNtoR, zdotNNtoR, k2s_aoint
+from pyscf.pbc.lno.tools import K2SDF, zdotCNtoR, zdotNNtoR, k2s_aoint, is_trs_kmesh
 
 FORCE_DFKCC = getattr(__config__, 'lno_cc_kccsd_FORCE_DFKCC', False)    # force using DF CC
 DEBUG_BLKSIZE = getattr(__config__, 'lno_cc_kccsd_DEBUG_BLKSIZE', False)
@@ -94,8 +93,8 @@ def K2SCCSD(mf, with_df, frozen, mo_coeff, mo_occ):
     log.debug1('naux= %d  nvir_pair= %d  mem_avail= %.1f  mem_vvvv= %.1f',
                naux, nvir_pair, mem_avail, mem_need)
 
-    if gamma_point(with_df.kpts[0]) and np.isrealobj(mo_coeff):
-        ''' Gamma-inclusive k-point mesh and time-reversal symmetry conserved
+    if is_trs_kmesh(with_df.cell, with_df.kpts) and np.isrealobj(mo_coeff):
+        ''' Gamma-inclusive or half-shifted k-point mesh and time-reversal symmetry conserved
         '''
         if not FORCE_DFKCC and (naux > nvir_pair or mem_need < mem_avail * 0.7):
             log.debug1('Using CCSD')

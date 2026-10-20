@@ -147,6 +147,27 @@ def _matpow(A, p):
     e, u = np.linalg.eigh(A)
     return np.dot(u * e**p, u.T.conj())
 
+def df_loop(with_df, blksize=None):
+    r''' Loop over the real 3-index DF tensor (packed AO pairs) of a molecular or PBC DF object.
+
+    A PBC DF object built at a single k-point k (e.g., a supercell SCF from `k2s_scf`) is
+    looped at (k,k). The tensor is real for k = Gamma and for any k with 2k = 0 (mod
+    reciprocal lattice), such as the supercell twist of a half-shifted k-point mesh.
+    '''
+    kpts = getattr(with_df, 'kpts', None)
+    if kpts is None or abs(np.asarray(kpts)).max() < 1e-9:
+        yield from with_df.loop(blksize=blksize)
+        return
+    kpt = np.asarray(kpts).reshape(-1,3)[0]
+    if blksize is None: blksize = with_df.blockdim
+    for LpqR, LpqI, sign in with_df.sr_loop([kpt,kpt], compact=True, blksize=blksize):
+        if abs(LpqI).max() > 1e-8:
+            raise RuntimeError('DF integrals at kpt %s are complex (max imag %.2e): the '
+                               'supercell twist is not time-reversal invariant.'
+                               % (kpt, abs(LpqI).max()))
+        yield LpqR
+        LpqR = LpqI = None
+
 def _map_lo_to_frag(mol, orbloc, frag_atmlist, verbose=None):
     r''' Assign input LOs (assumed orthonormal) to fragments using the Lowdin charge.
 
