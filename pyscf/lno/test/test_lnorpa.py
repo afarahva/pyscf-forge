@@ -16,9 +16,7 @@
 
 import unittest
 import numpy as np
-from pyscf import __config__
-setattr(__config__, 'lno_base_make_rdm1_DEBUG_BLKSIZE', True)    # debug blocking
-from pyscf import gto, scf, cc, lo
+from pyscf import gto, scf, cc, lo, lib
 from pyscf.lno import LNOCCSD, rpa
 from pyscf.lno import make_lno_rdm1
 
@@ -133,6 +131,11 @@ class WaterDimerRPA(unittest.TestCase):
         self.assertAlmostEqual(rpa.energy_sosex(U, J, tau, nocc, nvir), esx_ref, 8)
 
     def test_rdm1_rpa_amp(self):
+        # force blocking in the rdm1 code (module-level flag, restored afterwards)
+        with lib.temporary_env(make_lno_rdm1, DEBUG_BLKSIZE=True):
+            self._test_rdm1_rpa_amp()
+
+    def _test_rdm1_rpa_amp(self):
         mlno = self._lno()
         eris = mlno.ao2mo()
         J, eia, nocc, nvir = self._full_drccd(mlno, eris)

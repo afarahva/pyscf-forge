@@ -126,7 +126,7 @@ class KLNO(LNO):
         return 1. / len(self.kpts)
 
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        if self._lno_uses_rpa:  # real drCCD amplitudes: use the molecular rdm1 code
+        if self._lno_amp in ('bws2', 'rpa', 'sosex'):  # real orbitals: molecular rdm1 code
             return LNO.make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         occ_lno_type)
         kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
@@ -134,7 +134,7 @@ class KLNO(LNO):
                                 kappa=kappa)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        if self._lno_uses_rpa:
+        if self._lno_amp in ('bws2', 'rpa', 'sosex'):
             return LNO.make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         vir_lno_type)
         kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None

@@ -43,6 +43,7 @@ from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
 from pyscf.lno import rpa
+from pyscf.lno import bws2
 from pyscf.lno import domain
 from pyscf.lno.tools import df_loop
 
@@ -376,13 +377,19 @@ class LNO(lib.StreamObject):
 
         # low-level amplitudes
         #   lno_amp : amplitudes for the LNO density matrices
-        #             'mp2', 'kappa-mp2', 'rpa' or 'sosex' ('rpa' and 'sosex' both use the
-        #             drCCD amplitudes; they differ only in the energy expression)
+        #             'mp2', 'kappa-mp2', 'bws2', 'rpa' or 'sosex' ('rpa' and 'sosex'
+        #             both use the drCCD amplitudes; they differ only in the energy)
         #   pt2_amp : amplitudes for the fragment PT2 energy and the impurity CC guess;
         #             None uses lno_amp, otherwise one of the lno_amp choices
         self.lno_amp = 'mp2'
         self.pt2_amp = None
         self.kappa = 1.1        # kappa-MP2 regularization strength, arXiv:2508.15744
+        self.alpha = 1.0        # BW-s2(alpha) regularizer strength, arXiv:2309.01376
+        # BW-s2 solver; full-system energy (per unit cell for KLNO) set when solved
+        self.bws2_max_cycle = 50
+        self.bws2_conv_tol = 1e-8
+        self.e_corr_bws2_full = None
+        self._bws2 = None
         # drCCD solver, arXiv:2601.00131
         self.rpa_cd_thresh = 1e-6   # Cholesky threshold for the drCCD energy denominator
         self.rpa_max_cycle = 100
@@ -482,6 +489,9 @@ class LNO(lib.StreamObject):
         log.info('lno_amp = %s  pt2_amp = %s', self._lno_amp, self._pt2_amp)
         if 'kappa-mp2' in (self._lno_amp, self._pt2_amp):
             log.info('kappa = %s', self.kappa)
+        if 'bws2' in (self._lno_amp, self._pt2_amp):
+            log.info('alpha = %s  bws2_max_cycle = %d  bws2_conv_tol = %g',
+                     self.alpha, self.bws2_max_cycle, self.bws2_conv_tol)
         if self._lno_uses_rpa or self._pt2_uses_rpa:
             log.info('rpa_cd_thresh = %g  rpa_max_cycle = %d  rpa_conv_tol = %g  '
                      'rpa_diis_space = %d  rpa_damp = %g', self.rpa_cd_thresh,
@@ -528,6 +538,9 @@ class LNO(lib.StreamObject):
         if self._lno_uses_rpa or self._pt2_uses_rpa:
             if eris is None: eris = self.ao2mo()
             self.solve_rpa(eris)
+        if 'bws2' in (self._lno_amp, self._pt2_amp):
+            if eris is None: eris = self.ao2mo()
+            self.solve_bws2(eris)
 
         frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
                           self.lno_type, self.lno_thresh,
@@ -573,6 +586,12 @@ class LNO(lib.StreamObject):
         if self._lno_uses_rpa:
             return make_lo_rdm1_occ(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
                                     uvir_loc, occ_lno_type)
+        if self._lno_amp == 'bws2':
+            # MP2 dm in the dressed occupied basis, rotated back
+            moeoccW, U, erisW = self.get_bws2(eris)
+            dm = make_lo_rdm1_occ(erisW, moeoccW, moevir, np.dot(U.T, uocc_loc), uvir_loc,
+                                  occ_lno_type)
+            return np.linalg.multi_dot((U, dm, U.T))
         kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
                                 kappa=kappa)
@@ -581,11 +600,15 @@ class LNO(lib.StreamObject):
         if self._lno_uses_rpa:
             return make_lo_rdm1_vir(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
                                     uvir_loc, vir_lno_type)
+        if self._lno_amp == 'bws2':
+            moeoccW, U, erisW = self.get_bws2(eris)
+            return make_lo_rdm1_vir(erisW, moeoccW, moevir, np.dot(U.T, uocc_loc),
+                                    uvir_loc, vir_lno_type)
         kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
                                 kappa=kappa)
 
-    _AMP_TYPES = ('mp2', 'kappa-mp2', 'rpa', 'sosex')
+    _AMP_TYPES = ('mp2', 'kappa-mp2', 'bws2', 'rpa', 'sosex')
 
     @property
     def _lno_amp(self):
@@ -614,7 +637,7 @@ class LNO(lib.StreamObject):
 
     @property
     def _pt2_label(self):
-        return {'mp2': 'MP2', 'kappa-mp2': 'kappa-MP2', 'rpa': 'RPA',
+        return {'mp2': 'MP2', 'kappa-mp2': 'kappa-MP2', 'bws2': 'BW-s2', 'rpa': 'RPA',
                 'sosex': 'SOSEX'}[self._pt2_amp]
 
     @property
@@ -660,6 +683,36 @@ class LNO(lib.StreamObject):
         if self._rpa_amp is None or self._rpa_amp[0] is not eris:
             self.solve_rpa(eris)
         return self._rpa_amp[1]
+
+    def solve_bws2(self, eris):
+        r''' Full-system BW-s2(alpha). Sets `e_corr_bws2_full` and caches the dressed
+        occupied energies, orbitals and DF integrals used for LNO construction.
+        '''
+        log = logger.new_logger(self)
+        if self.prune_lno_basis:
+            raise NotImplementedError('BW-s2-based LNO does not support prune_lno_basis.')
+        if np.ndim(self.mo_occ) != 1:
+            raise NotImplementedError('BW-s2-based LNO is implemented for RHF only.')
+        moeocc, moevir = self.split_mo_energy()[1:3]
+        J = rpa.get_ovJ(eris)
+        conv, e_corr, moeoccW, U = bws2.kernel(J, moeocc, moevir, alpha=self.alpha,
+                                               max_cycle=self.bws2_max_cycle,
+                                               conv_tol=self.bws2_conv_tol,
+                                               max_memory=self.max_memory, log=log)
+        self.e_corr_bws2_full = e_corr * self._e_full_scale
+        log.note('Full-system BW-s2(alpha=%g):  converged = %s  E_corr = %.15g',
+                 self.alpha, conv, self.e_corr_bws2_full)
+        erisW = None
+        if self._lno_amp == 'bws2':
+            erisW = bws2._DressedERIS(einsum('iax,iI->Iax', J, U), self.max_memory,
+                                      verbose=self.verbose, stdout=self.stdout)
+        self._bws2 = (eris, moeoccW, U, erisW)
+        return e_corr
+
+    def get_bws2(self, eris):
+        if self._bws2 is None or self._bws2[0] is not eris or self._bws2[3] is None:
+            self.solve_bws2(eris)
+        return self._bws2[1:]
 
     def _precompute(self, *args, **kwargs):
         pass

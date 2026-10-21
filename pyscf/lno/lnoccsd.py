@@ -37,6 +37,7 @@ from pyscf import lib
 from pyscf.lno import LNO
 from pyscf.lno.regmp2 import kappa_factor
 from pyscf.lno import rpa as rpa_mod
+from pyscf.lno import bws2
 from pyscf.lno.tools import df_loop
 
 _fdot = np.dot
@@ -482,7 +483,7 @@ class MODIFIED_DFCCSD_complex:
 def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                    ccsd_t=False, log=None, verbose_imp=None,
                    max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None,
-                   rpa=None, rpa_kwargs=None, s1e=None):
+                   rpa=None, rpa_kwargs=None, s1e=None, bws2_alpha=None, bws2_kwargs=None):
     r''' Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -504,6 +505,9 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
             2 sum T V ('rpa'), or includes SOSEX exchange, sum T (2V - V_x) ('sosex').
             The active-space DF integrals are obtained by projecting those of `eris`
             (requires `s1e`).
+        bws2_alpha (float; optional):
+            If given, BW-s2(alpha) amplitudes of the active space replace the MP2 ones
+            in the fragment energy and the CCSD guess.
 
     Return:
         e_loc_corr_pt2, e_loc_corr_ccsd, e_loc_corr_ccsd_t:
@@ -564,7 +568,19 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                 t2 *= g
                 t2_ene = t2 * g
             cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-            if rpa is not None:
+            if bws2_alpha is not None:
+                # BW-s2: dressed active-space amplitudes, rotated back to the impurity
+                # orbitals, give the fragment energy and seed the CCSD.
+                mo_e = np.asarray(imp_eris.mo_energy).real
+                converged, t2 = bws2.kernel_dense(oovv, mo_e[:nactocc], mo_e[nactocc:],
+                                                  alpha=bws2_alpha, log=log,
+                                                  **(bws2_kwargs or {}))[::4]
+                if not converged:
+                    log.warn('Impurity BW-s2 did not converge, please be careful of the '
+                             'results.')
+                cput1 = log.timer_debug1('imp sol - bws2 amp', *cput1)
+                elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
+            elif rpa is not None:
                 # drCCD: the active-space RPA amplitudes give the fragment energy
                 # and seed the CCSD.
                 t2 = get_impurity_rpa_t2(eris, orbactocc, orbactvir, s1e,
@@ -606,8 +622,8 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
 
         t1 = t2 = oovv = imp_eris = mcc = None
 
-    pt2_label = rpa.upper() if rpa is not None else \
-                ('kappa-MP2' if kappa is not None else 'MP2')
+    pt2_label = ('BW-s2' if bws2_alpha is not None else rpa.upper() if rpa is not None
+                 else 'kappa-MP2' if kappa is not None else 'MP2')
     frag_msg = '  '.join([f'E_corr({pt2_label}) = {elcorr_pt2:.15g}',
                           f'E_corr(CCSD) = {elcorr_cc:.15g}',
                           f'E_corr(CCSD(T)) = {elcorr_cc_t:.15g}'])
@@ -746,7 +762,10 @@ class LNOCCSD(LNO):
         pt2_amp = self._pt2_amp
         return dict(kappa=self.kappa if pt2_amp == 'kappa-mp2' else None,
                     rpa=pt2_amp if self._pt2_uses_rpa else None,
-                    rpa_kwargs=self._rpa_kwargs, s1e=self.s1e)
+                    rpa_kwargs=self._rpa_kwargs, s1e=self.s1e,
+                    bws2_alpha=self.alpha if pt2_amp == 'bws2' else None,
+                    bws2_kwargs=dict(max_cycle=self.bws2_max_cycle,
+                                     conv_tol=self.bws2_conv_tol))
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by `impurity_solve` collected in `frag_res`.
