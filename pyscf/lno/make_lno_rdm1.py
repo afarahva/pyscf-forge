@@ -47,6 +47,20 @@ from pyscf.lno.regmp2 import kappa_factor
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_DEBUG_BLKSIZE', False)
 
 
+def _make_t2(eris, num, denom, kappa=None):
+    r''' MP2 amplitude conj(num)/denom (optionally kappa-regularized).
+
+        For factorized RPA amplitudes (`eris.rpa_amp`, see `pyscf.lno.rpa`) the
+        numerator already is -T and no denominator is applied.
+    '''
+    if getattr(eris, 'rpa_amp', False):
+        return -num
+    t2 = np.conj(num) / denom
+    if kappa is not None:
+        t2 *= kappa_factor(denom, kappa)
+    return t2
+
+
 def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type, kappa=None):
     if dm_type == '1h':
         dm = make_lo_rdm1_occ_1h(eris, moeocc, moevir, uocc, kappa=kappa)
@@ -139,9 +153,7 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True, kappa=Non
                 jvL = eris.get_occ_blk(j0,j1)
                 ejv = eov[j0:j1]
             denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / denom
-            if kappa is not None:
-                t2ijvv *= kappa_factor(denom, kappa)
+            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), denom, kappa)
             jvL = None
             denom = None
             if with_occ:
@@ -188,9 +200,7 @@ def make_full_rdm1_occ(eris, moeocc, moevir, kappa=None):
                 jvL = eris.get_occ_blk(j0,j1)
                 ejv = eov[j0:j1]
             denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / denom
-            if kappa is not None:
-                t2ijvv *= kappa_factor(denom, kappa)
+            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), denom, kappa)
             jvL = None
             denom = None
             dm[i0:i1,j0:j1]  = 4*lib.einsum('ikab,jkab->ij', np.conj(t2ijvv), t2ijvv)
@@ -233,9 +243,7 @@ def make_full_rdm1_vir(eris, moeocc, moevir, kappa=None):
                 jvL = eris.get_occ_blk(j0,j1)
                 ejv = eov[j0:j1]
             eijvv = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = np.conj(lib.einsum('iax,jbx->ijab', ivL, jvL)) / eijvv
-            if kappa is not None:
-                t2ijvv *= kappa_factor(eijvv, kappa)
+            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), eijvv, kappa)
             jvL = None
             eijvv = None
 
@@ -287,9 +295,7 @@ def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u, kappa=None):
             ivL = eris.get_occ_blk(i0,i1)
             eiv = eov[i0:i1]
             eiKvv = lib.direct_sum('ia+Kb->iKab', eiv, eKv)
-            t2iKvv = np.conj(lib.einsum('iax,Kbx->iKab', ivL, KvL)) / eiKvv
-            if kappa is not None:
-                t2iKvv *= kappa_factor(eiKvv, kappa)
+            t2iKvv = _make_t2(eris, lib.einsum('iax,Kbx->iKab', ivL, KvL), eiKvv, kappa)
             ivL = None
             eiKvv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
@@ -299,9 +305,7 @@ def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u, kappa=None):
                     jvL = eris.get_occ_blk(j0,j1)
                     ejv = eov[j0:j1]
                     ejKvv = lib.direct_sum('ia+Kb->iKab', ejv, eKv)
-                    t2jKvv = np.conj(lib.einsum('iax,Kbx->iKab', jvL, KvL)) / ejKvv
-                    if kappa is not None:
-                        t2jKvv *= kappa_factor(ejKvv, kappa)
+                    t2jKvv = _make_t2(eris, lib.einsum('iax,Kbx->iKab', jvL, KvL), ejKvv, kappa)
                     jvL = None
                     ejKvv = None
 
@@ -355,9 +359,7 @@ def make_lo_rdm1_occ_1p(eris, moeocc, moevir, u, kappa=None):
             eob = eov[:,b0:b1]
 
             eooAb = lib.direct_sum('iA+jb->ijAb', eoA, eob)
-            t2ooAb = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, obL)) / eooAb
-            if kappa is not None:
-                t2ooAb *= kappa_factor(eooAb, kappa)
+            t2ooAb = _make_t2(eris, lib.einsum('iAx,jbx->ijAb', oAL, obL), eooAb, kappa)
             obL = None
             eooAb = None
 
@@ -414,9 +416,7 @@ def make_lo_rdm1_occ_2p(eris, moeocc, moevir, u, kappa=None):
                 oBL = eris.xform_vir(u[:,B0:B1])
                 eoB = eoV[:,B0:B1]
             eooAB = lib.direct_sum('iA+jB->ijAB', eoA, eoB)
-            t2ooAB = np.conj(lib.einsum('iAx,jBx->ijAB', oAL, oBL)) / eooAB
-            if kappa is not None:
-                t2ooAB *= kappa_factor(eooAB, kappa)
+            t2ooAB = _make_t2(eris, lib.einsum('iAx,jBx->ijAB', oAL, oBL), eooAB, kappa)
             oBL = None
             eooAB = None
 
@@ -469,9 +469,7 @@ def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u, kappa=None):
             oaL = eris.get_vir_blk(a0,a1)
             eoa = eov[:,a0:a1]
             eooAa = lib.direct_sum('iA+jb->ijAb', eoA, eoa)
-            t2ooAa = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, oaL)) / eooAa
-            if kappa is not None:
-                t2ooAa *= kappa_factor(eooAa, kappa)
+            t2ooAa = _make_t2(eris, lib.einsum('iAx,jbx->ijAb', oAL, oaL), eooAa, kappa)
             oaL = None
             eooAa = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
@@ -481,9 +479,7 @@ def make_lo_rdm1_vir_1p(eris, moeocc, moevir, u, kappa=None):
                     obL = eris.get_vir_blk(b0,b1)
                     eob = eov[:,b0:b1]
                     eooAb = lib.direct_sum('iA+jb->ijAb', eoA, eob)
-                    t2ooAb = np.conj(lib.einsum('iAx,jbx->ijAb', oAL, obL)) / eooAb
-                    if kappa is not None:
-                        t2ooAb *= kappa_factor(eooAb, kappa)
+                    t2ooAb = _make_t2(eris, lib.einsum('iAx,jbx->ijAb', oAL, obL), eooAb, kappa)
                     obL = None
                     eooAb = None
 
@@ -538,9 +534,7 @@ def make_lo_rdm1_vir_1h(eris, moeocc, moevir, u, kappa=None):
             ejv = eov[j0:j1]
 
             eIjvv = lib.direct_sum('Ia+jb->Ijab', eIv, ejv)
-            t2Ijvv = np.conj(lib.einsum('Iax,jbx->Ijab', IvL, jvL)) / eIjvv
-            if kappa is not None:
-                t2Ijvv *= kappa_factor(eIjvv, kappa)
+            t2Ijvv = _make_t2(eris, lib.einsum('Iax,jbx->Ijab', IvL, jvL), eIjvv, kappa)
             jvL = None
             eIjvv = None
 
@@ -597,9 +591,7 @@ def make_lo_rdm1_vir_2h(eris, moeocc, moevir, u, kappa=None):
                 JvL = eris.xform_occ(u[:,J0:J1])
                 eJv = eOv[J0:J1]
             eIJvv = lib.direct_sum('Ia+Jb->IJab', eIv, eJv)
-            t2IJvv = np.conj(lib.einsum('Iax,Jbx->IJab', IvL, JvL)) / eIJvv
-            if kappa is not None:
-                t2IJvv *= kappa_factor(eIJvv, kappa)
+            t2IJvv = _make_t2(eris, lib.einsum('Iax,Jbx->IJab', IvL, JvL), eIJvv, kappa)
             JvL = None
             eIJvv = None
 

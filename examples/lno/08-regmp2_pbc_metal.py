@@ -3,21 +3,22 @@ r'''
 kappa-regularized MP2 (kappa-MP2) in periodic LNO-CCSD -- METAL (bcc lithium).
 
 Companion of examples/lno/07-regmp2_pbc_insulator.py.  Same 2x2x2 / small-DZ
-setup, comparing baseline vs regmp2_cc vs regmp2_lno.
+setup, comparing baseline vs pt2_amp='kappa-mp2' vs lno_amp='kappa-mp2' (with
+pt2_amp='mp2').
 
 Unlike the insulator, a metal has small occupied-virtual gaps, so some MP2
 denominators are tiny and the plain MP2 amplitudes are large.  The damping
 factor g = 1 - exp(-kappa*Delta) then acts strongly, and the choice of where
 kappa-MP2 is applied matters a lot:
 
-  * regmp2_cc  strongly changes the fragment MP2 correlation energy (the CCSD
+  * pt2_amp='kappa-mp2' strongly changes the fragment MP2 correlation energy (the CCSD
     guess).  For the small 2x2x2 mesh below the impurity CCSD still converges
     and lands near the baseline CCSD, but the guess it started from is very
     different.  For denser meshes / smaller gaps the un-regularized MP2
     amplitudes can grow so large that seeding CCSD with them (or with the
     heavily-damped kappa guess) makes the impurity CCSD hard to converge --
     watch for "Impurity CCSD did not converge" warnings in the log.
-  * regmp2_lno changes which local natural orbitals are selected, i.e. the
+  * lno_amp='kappa-mp2' changes which local natural orbitals are selected, i.e. the
     active space itself, so its effect does not simply cancel in CCSD.
 
 Compare the size of the MP2 shift here with the insulator in example 07.
@@ -48,9 +49,9 @@ mf = k2s_scf(kmf)
 orbocc = mf.mo_coeff[:, mf.mo_occ > 1e-6]
 mlo = lo.PipekMezey(mf.cell, orbocc)
 lo_coeff = mlo.kernel()
-while True:
-    lo_coeff1 = mlo.stability_jacobi()[1]
-    if lo_coeff1 is lo_coeff:
+for i in range(100):  # jacobi sweeps to avoid a local minimum
+    lo_coeff1, stable = mlo.stability_jacobi(return_status=True)
+    if stable:
         break
     mlo = lo.PipekMezey(mf.mol, lo_coeff1)
     mlo.init_guess = None
@@ -72,17 +73,17 @@ def run(**kw):
     return mcc.e_corr_pt2, mcc.e_corr_ccsd   # per unit cell
 
 base = run()
-cc   = run(regmp2_cc=True)
-lno  = run(regmp2_lno=True)
+cc   = run(pt2_amp='kappa-mp2')                 # kappa-MP2 energy / CCSD guess only
+lno  = run(lno_amp='kappa-mp2', pt2_amp='mp2')  # kappa-MP2 LNO density matrices only
 
 print()
 print('bcc Li (metal), KLNO-CCSD per cell, 2x2x2, gth-dzv, kappa=1.1')
 print('                          E_MP2            E_CCSD')
 print('baseline            % .10f  % .10f' % base)
-print('regmp2_cc           % .10f  % .10f' % cc)
-print('regmp2_lno          % .10f  % .10f' % lno)
+print('pt2_amp=kappa-mp2   % .10f  % .10f' % cc)
+print('lno_amp=kappa-mp2   % .10f  % .10f' % lno)
 print()
-print('MP2 shift (regmp2_cc):  % .3e Eh  (%.0f%% of the baseline MP2 energy)'
+print('MP2 shift (pt2_amp):  % .3e Eh  (%.0f%% of the baseline MP2 energy)'
       % (cc[0] - base[0], 100*abs((cc[0]-base[0])/base[0])))
 print('Small gaps -> strong damping: the MP2 energy / CCSD guess changes far')
 print('more than for the insulator in example 07.')

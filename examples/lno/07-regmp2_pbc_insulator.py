@@ -5,14 +5,16 @@ kappa-regularized MP2 (kappa-MP2) in periodic LNO-CCSD -- INSULATOR (diamond).
 Companion of examples/lno/08-regmp2_pbc_metal.py.  Both run k-point LNO-CCSD
 (KLNOCCSD) on a 2x2x2 mesh with a small double-zeta basis and compare three
 calculations:
-    baseline    : plain MP2 guess / plain LNO density matrices
-    regmp2_cc   : kappa-MP2 only for the fragment MP2 energy and CCSD guess
-    regmp2_lno  : kappa-MP2 only for the LNO density matrices (active space)
+    baseline                         : defaults (MP2 everywhere)
+    pt2_amp='kappa-mp2'              : kappa-MP2 only for the fragment MP2 energy
+                                       and CCSD guess
+    lno_amp='kappa-mp2', pt2_amp='mp2' : kappa-MP2 only for the LNO density
+                                       matrices (active space)
 
 For a wide-gap insulator the MP2 denominators are large, so the damping factor
 g = 1 - exp(-kappa*Delta) is close to 1 everywhere.  Regularization therefore
-barely changes anything: the MP2 energy shifts only a little, and both regmp2_cc
-and regmp2_lno give essentially the baseline LNO-CCSD energy.  Contrast this with
+barely changes anything: the MP2 energy shifts only a little, and both settings
+give essentially the baseline LNO-CCSD energy.  Contrast this with
 the metal in example 08.
 '''
 
@@ -43,9 +45,9 @@ mf = k2s_scf(kmf)
 orbocc = mf.mo_coeff[:, mf.mo_occ > 1e-6]
 mlo = lo.PipekMezey(mf.cell, orbocc)
 lo_coeff = mlo.kernel()
-while True:  # jacobi sweeps to avoid a local minimum
-    lo_coeff1 = mlo.stability_jacobi()[1]
-    if lo_coeff1 is lo_coeff:
+for i in range(100):  # jacobi sweeps to avoid a local minimum
+    lo_coeff1, stable = mlo.stability_jacobi(return_status=True)
+    if stable:
         break
     mlo = lo.PipekMezey(mf.mol, lo_coeff1)
     mlo.init_guess = None
@@ -68,17 +70,17 @@ def run(**kw):
     return mcc.e_corr_pt2, mcc.e_corr_ccsd   # per unit cell
 
 base = run()
-cc   = run(regmp2_cc=True)
-lno  = run(regmp2_lno=True)
+cc   = run(pt2_amp='kappa-mp2')                 # kappa-MP2 energy / CCSD guess only
+lno  = run(lno_amp='kappa-mp2', pt2_amp='mp2')  # kappa-MP2 LNO density matrices only
 
 print()
 print('Diamond (insulator), KLNO-CCSD per cell, 2x2x2, gth-dzv, kappa=1.1')
 print('                          E_MP2            E_CCSD')
 print('baseline            % .10f  % .10f' % base)
-print('regmp2_cc           % .10f  % .10f' % cc)
-print('regmp2_lno          % .10f  % .10f' % lno)
+print('pt2_amp=kappa-mp2   % .10f  % .10f' % cc)
+print('lno_amp=kappa-mp2   % .10f  % .10f' % lno)
 print()
-print('CCSD change vs baseline:  regmp2_cc % .2e Eh   regmp2_lno % .2e Eh'
+print('CCSD change vs baseline:  pt2_amp % .2e Eh   lno_amp % .2e Eh'
       % (cc[1] - base[1], lno[1] - base[1]))
-print('Wide gap -> weak damping: MP2 barely shifts and both regmp2_cc and')
-print('regmp2_lno reproduce the baseline LNO-CCSD energy. See example 08 (metal).')
+print('Wide gap -> weak damping: MP2 barely shifts and both settings')
+print('reproduce the baseline LNO-CCSD energy. See example 08 (metal).')

@@ -36,6 +36,7 @@ from pyscf import lib
 
 from pyscf.lno import LNO
 from pyscf.lno.regmp2 import kappa_factor
+from pyscf.lno import rpa as rpa_mod
 from pyscf.lno.tools import df_loop
 
 _fdot = np.dot
@@ -480,7 +481,8 @@ class MODIFIED_DFCCSD_complex:
 '''
 def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                    ccsd_t=False, log=None, verbose_imp=None,
-                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None):
+                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None,
+                   rpa=None, rpa_kwargs=None, s1e=None):
     r''' Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -493,6 +495,15 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
             item (0 is returned otherwise).
         frozen (int or list; optional):
             Same syntax as `frozen` in MP2, CCSD, etc.
+        kappa (float; optional):
+            If given, kappa-MP2 amplitudes replace the MP2 ones in the fragment energy
+            and the CCSD guess.
+        rpa (str; optional):
+            'rpa' or 'sosex': the active-space drCCD amplitudes replace the MP2 ones in
+            the fragment energy and the CCSD guess. The energy is the direct RPA one,
+            2 sum T V ('rpa'), or includes SOSEX exchange, sum T (2V - V_x) ('sosex').
+            The active-space DF integrals are obtained by projecting those of `eris`
+            (requires `s1e`).
 
     Return:
         e_loc_corr_pt2, e_loc_corr_ccsd, e_loc_corr_ccsd_t:
@@ -553,7 +564,18 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
                 t2 *= g
                 t2_ene = t2 * g
             cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-            elcorr_pt2 = get_fragment_energy(oovv, t2_ene, uocc_loc).real
+            if rpa is not None:
+                # drCCD: the active-space RPA amplitudes give the fragment energy
+                # and seed the CCSD.
+                t2 = get_impurity_rpa_t2(eris, orbactocc, orbactvir, s1e,
+                                         imp_eris.mo_energy, log, rpa_kwargs)
+                cput1 = log.timer_debug1('imp sol - drccd amp', *cput1)
+                if rpa == 'sosex':
+                    elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
+                else:
+                    elcorr_pt2 = rpa_mod.get_fragment_energy_rpa(oovv, t2, uocc_loc)
+            else:
+                elcorr_pt2 = get_fragment_energy(oovv, t2_ene, uocc_loc).real
             t2_ene = None
             cput1 = log.timer_debug1('imp sol - mp2 ene', *cput1)
 
@@ -584,11 +606,33 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
 
         t1 = t2 = oovv = imp_eris = mcc = None
 
-    frag_msg = '  '.join([f'E_corr(MP2) = {elcorr_pt2:.15g}',
+    pt2_label = rpa.upper() if rpa is not None else \
+                ('kappa-MP2' if kappa is not None else 'MP2')
+    frag_msg = '  '.join([f'E_corr({pt2_label}) = {elcorr_pt2:.15g}',
                           f'E_corr(CCSD) = {elcorr_cc:.15g}',
                           f'E_corr(CCSD(T)) = {elcorr_cc_t:.15g}'])
 
     return (elcorr_pt2, elcorr_cc, elcorr_cc_t), frag_msg
+
+def get_impurity_rpa_t2(eris, orbactocc, orbactvir, s1e, mo_energy, log, rpa_kwargs=None):
+    r''' Active-space drCCD amplitudes t2[i,j,a,b] using the DF integrals of the
+    full-system `eris` projected onto the (semi-canonical) active orbitals.
+    '''
+    if s1e is None:
+        raise ValueError('s1e is required for the impurity drCCD.')
+    if rpa_kwargs is None: rpa_kwargs = {}
+    nactocc, nactvir = orbactocc.shape[1], orbactvir.shape[1]
+    uocc = fdot(eris.orbocc.T.conj(), s1e, orbactocc).real
+    uvir = fdot(eris.orbvir.T.conj(), s1e, orbactvir).real
+    J = rpa_mod.get_ovJ_act(eris, uocc, uvir).reshape(nactocc*nactvir,-1)
+    mo_e = np.asarray(mo_energy).real
+    eia = (mo_e[None,nactocc:] - mo_e[:nactocc,None]).ravel()
+    conv, e_rpa, U, tau = rpa_mod.kernel(J, eia, log=log, **rpa_kwargs)
+    if not conv:
+        log.warn('Impurity drCCD did not converge, please be careful of the results.')
+    log.debug('    impsol:  active-space E_corr(RPA) = %.15g', e_rpa)
+    J = None
+    return rpa_mod.make_t2(U, tau, nactocc, nactvir)
 
 def get_maskact(frozen, nmo):
     # Convert frozen to 0 bc PySCF solvers do not support frozen=None or empty list
@@ -690,11 +734,19 @@ class LNOCCSD(LNO):
         if self.kwargs_imp is not None:
             mcc = mcc.set(**self.kwargs_imp)
 
-        kappa = self.kappa if (self.regmp2 or self.regmp2_cc) else None
         return impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris, log=log,
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
-                              max_las_size_ccsd_t=self._max_las_size_ccsd_t, kappa=kappa)
+                              max_las_size_ccsd_t=self._max_las_size_ccsd_t,
+                              **self._pt2_impurity_kwargs)
+
+    @property
+    def _pt2_impurity_kwargs(self):
+        r''' Low-level amplitude arguments of `impurity_solve` from `pt2_amp`. '''
+        pt2_amp = self._pt2_amp
+        return dict(kappa=self.kappa if pt2_amp == 'kappa-mp2' else None,
+                    rpa=pt2_amp if self._pt2_uses_rpa else None,
+                    rpa_kwargs=self._rpa_kwargs, s1e=self.s1e)
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by `impurity_solve` collected in `frag_res`.
@@ -723,15 +775,15 @@ class LNOCCSD(LNO):
     def _finalize(self):
         r''' Hook for dumping results and clearing up the object.'''
         logger.note(self, 'E(%s) = %.15g  E_corr = %.15g',
-                    'LNOMP2', self.e_tot_pt2, self.e_corr_pt2)
+                    'LNO'+self._pt2_label, self.e_tot_pt2, self.e_corr_pt2)
         logger.note(self, 'E(%s) = %.15g  E_corr = %.15g',
                     'LNOCCSD', self.e_tot, self.e_corr)
         if self.ccsd_t:
             logger.note(self, 'E(%s) = %.15g  E_corr = %.15g',
                         'LNOCCSD_T', self.e_tot_ccsd_t, self.e_corr_ccsd_t)
         logger.note(self, 'Summary by spin components')
-        logger.note(self, 'LNOMP2   Ess = %.15g  Eos = %.15g  Escs = %.15g',
-                    self.e_corr_pt2_ss, self.e_corr_pt2_os, self.e_corr_pt2_scs)
+        logger.note(self, '%-8s Ess = %.15g  Eos = %.15g  Escs = %.15g',
+                    'LNO'+self._pt2_label, self.e_corr_pt2_ss, self.e_corr_pt2_os, self.e_corr_pt2_scs)
         logger.note(self, 'LNOCCSD  Ess = %.15g  Eos = %.15g  Escs = %.15g',
                     self.e_corr_ccsd_ss, self.e_corr_ccsd_os, self.e_corr_ccsd_scs)
         return self

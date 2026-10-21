@@ -42,6 +42,7 @@ from pyscf import lib
 from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
+from pyscf.lno import rpa
 from pyscf.lno import domain
 from pyscf.lno.tools import df_loop
 
@@ -373,11 +374,26 @@ class LNO(lib.StreamObject):
         self.prune_lno_basis = False  # whether or not to use domains
         self.lno_basis_thresh = 0.02  # default Boughton-Pulay parameter
 
-        # regularized mp2
-        self.regmp2_lno = False # kappa-reg amplitudes in the LNO density matrices only
-        self.regmp2_cc = False  # kappa-reg amplitudes in the MP2 energy / CC guess only
-        self.regmp2 = False     # kappa-reg everywhere; supersedes the two above
-        self.kappa = 1.1        # kappa-MP2 regularization strength
+        # low-level amplitudes
+        #   lno_amp : amplitudes for the LNO density matrices
+        #             'mp2', 'kappa-mp2', 'rpa' or 'sosex' ('rpa' and 'sosex' both use the
+        #             drCCD amplitudes; they differ only in the energy expression)
+        #   pt2_amp : amplitudes for the fragment PT2 energy and the impurity CC guess;
+        #             None uses lno_amp, otherwise one of the lno_amp choices
+        self.lno_amp = 'mp2'
+        self.pt2_amp = None
+        self.kappa = 1.1        # kappa-MP2 regularization strength, arXiv:2508.15744
+        # drCCD solver, arXiv:2601.00131
+        self.rpa_cd_thresh = 1e-6   # Cholesky threshold for the drCCD energy denominator
+        self.rpa_max_cycle = 100
+        self.rpa_conv_tol = 1e-8
+        self.rpa_conv_tol_normu = 1e-6
+        self.rpa_diis_space = 8
+        self.rpa_damp = 0.
+        # full-system drCCD energies (per unit cell for KLNO), set when drCCD is solved
+        self.e_corr_rpa_full = None
+        self.e_corr_sosex_full = None   # only if pt2_amp resolves to 'sosex'
+        self._rpa_amp = None
 
         # df eri
         self._ovL = None
@@ -463,9 +479,13 @@ class LNO(lib.StreamObject):
         log.info('_ovL_to_save = %s', self._ovL_to_save)
         log.info('force_outcore_ao2mo = %s', self.force_outcore_ao2mo)
         log.info('_match_oldcode = %s', self._match_oldcode)
-        if self.regmp2 or self.regmp2_lno or self.regmp2_cc:
-            log.info('regmp2 = %s  regmp2_lno = %s  regmp2_cc = %s  kappa = %s',
-                     self.regmp2, self.regmp2_lno, self.regmp2_cc, self.kappa)
+        log.info('lno_amp = %s  pt2_amp = %s', self._lno_amp, self._pt2_amp)
+        if 'kappa-mp2' in (self._lno_amp, self._pt2_amp):
+            log.info('kappa = %s', self.kappa)
+        if self._lno_uses_rpa or self._pt2_uses_rpa:
+            log.info('rpa_cd_thresh = %g  rpa_max_cycle = %d  rpa_conv_tol = %g  '
+                     'rpa_diis_space = %d  rpa_damp = %g', self.rpa_cd_thresh,
+                     self.rpa_max_cycle, self.rpa_conv_tol, self.rpa_diis_space, self.rpa_damp)
         return self
 
     def kernel(self, eris=None):
@@ -504,6 +524,10 @@ class LNO(lib.StreamObject):
         log.timer('LO and fragment  ', *cput0)
 
         self._precompute()
+
+        if self._lno_uses_rpa or self._pt2_uses_rpa:
+            if eris is None: eris = self.ao2mo()
+            self.solve_rpa(eris)
 
         frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
                           self.lno_type, self.lno_thresh,
@@ -546,14 +570,96 @@ class LNO(lib.StreamObject):
             return eris
 
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        if self._lno_uses_rpa:
+            return make_lo_rdm1_occ(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
+                                    uvir_loc, occ_lno_type)
+        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
                                 kappa=kappa)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        if self._lno_uses_rpa:
+            return make_lo_rdm1_vir(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
+                                    uvir_loc, vir_lno_type)
+        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
                                 kappa=kappa)
+
+    _AMP_TYPES = ('mp2', 'kappa-mp2', 'rpa', 'sosex')
+
+    @property
+    def _lno_amp(self):
+        amp = str(self.lno_amp).lower()
+        if amp not in self._AMP_TYPES:
+            raise ValueError('lno_amp must be one of %s (got %s)' % (self._AMP_TYPES, amp))
+        return amp
+
+    @property
+    def _pt2_amp(self):
+        if self.pt2_amp is None:
+            return self._lno_amp
+        amp = str(self.pt2_amp).lower()
+        if amp not in self._AMP_TYPES:
+            raise ValueError('pt2_amp must be None or one of %s (got %s)' %
+                             (self._AMP_TYPES, amp))
+        return amp
+
+    @property
+    def _lno_uses_rpa(self):
+        return self._lno_amp in ('rpa', 'sosex')
+
+    @property
+    def _pt2_uses_rpa(self):
+        return self._pt2_amp in ('rpa', 'sosex')
+
+    @property
+    def _pt2_label(self):
+        return {'mp2': 'MP2', 'kappa-mp2': 'kappa-MP2', 'rpa': 'RPA',
+                'sosex': 'SOSEX'}[self._pt2_amp]
+
+    @property
+    def _e_full_scale(self):
+        r''' Factor converting a full-system energy to the units of the fragment sum. '''
+        return 1.
+
+    @property
+    def _rpa_kwargs(self):
+        return dict(cd_thresh=self.rpa_cd_thresh, max_cycle=self.rpa_max_cycle,
+                    conv_tol=self.rpa_conv_tol, conv_tol_normu=self.rpa_conv_tol_normu,
+                    diis_space=self.rpa_diis_space, damp=self.rpa_damp)
+
+    def solve_rpa(self, eris):
+        r''' Full-system factorized drCCD. Sets `e_corr_rpa_full` (and `e_corr_sosex_full`
+        if pt2_amp is 'sosex') and caches the amplitudes used for LNO construction.
+        '''
+        log = logger.new_logger(self)
+        if self.prune_lno_basis:
+            raise NotImplementedError('RPA-based LNO does not support prune_lno_basis.')
+        if np.ndim(self.mo_occ) != 1:
+            raise NotImplementedError('RPA-based LNO is implemented for RHF only.')
+        moeocc, moevir = self.split_mo_energy()[1:3]
+        nocc, nvir = moeocc.size, moevir.size
+        J = rpa.get_ovJ(eris).reshape(nocc*nvir,-1)
+        eia = (moevir[None,:] - moeocc[:,None]).ravel()
+        conv, e_rpa, U, tau = rpa.kernel(J, eia, log=log, **self._rpa_kwargs)
+        self.e_corr_rpa_full = e_rpa * self._e_full_scale
+        log.note('Full-system drCCD:  converged = %s  E_corr(RPA) = %.15g',
+                 conv, self.e_corr_rpa_full)
+        if self._pt2_amp == 'sosex':
+            e_sosex = rpa.energy_sosex(U, J, tau, nocc, nvir, max_memory=self.max_memory)
+            self.e_corr_sosex_full = e_sosex * self._e_full_scale
+            log.note('Full-system drCCD:  E_corr(SOSEX) = %.15g', self.e_corr_sosex_full)
+        J = None
+        if self._lno_uses_rpa:
+            self._rpa_amp = (eris, rpa._RPAAmpERIS(U.reshape(nocc,nvir,-1), tau,
+                                                   self.max_memory, verbose=self.verbose,
+                                                   stdout=self.stdout))
+        return e_rpa
+
+    def get_rpa_amp(self, eris):
+        if self._rpa_amp is None or self._rpa_amp[0] is not eris:
+            self.solve_rpa(eris)
+        return self._rpa_amp[1]
 
     def _precompute(self, *args, **kwargs):
         pass

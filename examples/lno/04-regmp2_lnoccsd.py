@@ -1,18 +1,21 @@
 #!/usr/bin/env python
 r'''
 kappa-regularized MP2 (kappa-MP2) in restricted LNO-CCSD: behavior of the
-regmp2 switches.
+low-level amplitude settings.
 
-See LNO.__init__ for the switches (regmp2_lno, regmp2_cc, regmp2) and
-examples/lno/06-regmp2_dimer_compare.py for the physical motivation.
+See LNO.__init__ for the settings and examples/lno/06-regmp2_dimer_compare.py
+for the physical motivation:
+    lno_amp : amplitudes for the LNO density matrices (default 'mp2')
+    pt2_amp : amplitudes for the fragment MP2 energy and the CCSD guess
+              (default None: same as lno_amp)
 
 This script sanity-checks the implementation on a single water molecule:
-  * with a huge kappa the damping factor g -> 1, so regmp2=True must reproduce
-    the plain (flags-off) result exactly;
-  * regmp2 (everything) equals switching on regmp2_lno and regmp2_cc together;
-  * regmp2_cc changes the reported fragment MP2 energy (kappa-MP2 energy),
-    while regmp2_lno leaves it essentially unchanged (only the LNO active-space
-    selection is affected).
+  * with a huge kappa the damping factor g -> 1, so lno_amp='kappa-mp2' must
+    reproduce the default (MP2) result exactly;
+  * pt2_amp=None follows lno_amp, i.e. equals pt2_amp='kappa-mp2';
+  * pt2_amp='kappa-mp2' alone changes the reported fragment MP2 energy
+    (kappa-MP2 energy), while lno_amp='kappa-mp2' with pt2_amp='mp2' leaves it
+    essentially unchanged (only the LNO active-space selection is affected).
 '''
 
 import numpy as np
@@ -36,22 +39,22 @@ def run(**kw):
     return mcc.e_corr_pt2, mcc.e_corr_ccsd
 
 base = run()
-big  = run(regmp2=True, kappa=1e6)
-full = run(regmp2=True, kappa=1.1)
-lno_only = run(regmp2_lno=True, kappa=1.1)
-cc_only  = run(regmp2_cc=True,  kappa=1.1)
-both     = run(regmp2_lno=True, regmp2_cc=True, kappa=1.1)
+big  = run(lno_amp='kappa-mp2', kappa=1e6)
+full = run(lno_amp='kappa-mp2', kappa=1.1)
+lno_only = run(lno_amp='kappa-mp2', pt2_amp='mp2', kappa=1.1)
+cc_only  = run(pt2_amp='kappa-mp2', kappa=1.1)
+both     = run(lno_amp='kappa-mp2', pt2_amp='kappa-mp2', kappa=1.1)
 
 print()
-print('                              mp2              ccsd')
-print('baseline (flags off)     % .10f  % .10f' % base)
-print('regmp2=True   kappa=1e6  % .10f  % .10f' % big)
-print('regmp2=True   kappa=1.1  % .10f  % .10f' % full)
-print('regmp2_lno    kappa=1.1  % .10f  % .10f' % lno_only)
-print('regmp2_cc     kappa=1.1  % .10f  % .10f' % cc_only)
-print('lno+cc flags  kappa=1.1  % .10f  % .10f' % both)
+print('                                          mp2              ccsd')
+print('default (MP2)                        % .10f  % .10f' % base)
+print('lno_amp=kappa-mp2         kappa=1e6  % .10f  % .10f' % big)
+print('lno_amp=kappa-mp2         kappa=1.1  % .10f  % .10f' % full)
+print('lno_amp=kappa, pt2_amp=mp2  kappa=1.1  % .10f  % .10f' % lno_only)
+print('pt2_amp=kappa-mp2         kappa=1.1  % .10f  % .10f' % cc_only)
+print('lno_amp=pt2_amp=kappa-mp2 kappa=1.1  % .10f  % .10f' % both)
 
 assert np.allclose(base, big,  atol=1e-8), 'large-kappa must match baseline'
-assert np.allclose(full, both, atol=1e-9), 'regmp2 must equal (lno & cc)'
-assert not np.isclose(cc_only[0], base[0], atol=1e-6), 'regmp2_cc must change MP2 energy'
+assert np.allclose(full, both, atol=1e-9), 'pt2_amp=None must follow lno_amp'
+assert not np.isclose(cc_only[0], base[0], atol=1e-6), 'pt2_amp=kappa-mp2 must change MP2 energy'
 print('\nall checks passed')

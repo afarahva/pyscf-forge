@@ -4,21 +4,23 @@ kappa-regularized MP2 (kappa-MP2) in LNO-CCSD: water dimer comparison.
 
 kappa-MP2 (arXiv:2508.15744) damps each MP2 amplitude by a single factor
     g_ijab = 1 - exp(-kappa * (e_a + e_b - e_i - e_j)),    kappa = 1.1 (default)
-The LNO base class exposes three switches (see LNO.__init__):
-    regmp2_lno : use kappa-MP2 amplitudes only in the LNO density matrices
-                 (i.e. when choosing the local natural orbital active space)
-    regmp2_cc  : use kappa-MP2 amplitudes only for the fragment MP2 energy and
-                 the CCSD initial guess
-    regmp2     : use kappa-MP2 everywhere (supersedes the two above)
+The LNO base class has two low-level amplitude settings (see LNO.__init__):
+    lno_amp : amplitudes for the LNO density matrices (i.e. when choosing the
+              local natural orbital active space); default 'mp2'
+    pt2_amp : amplitudes for the fragment MP2 energy and the CCSD initial
+              guess; default None (same as lno_amp)
+lno_amp='kappa-mp2' alone uses kappa-MP2 everywhere.
 
 This script runs LNO-CCSD on a water dimer at lno_thresh = [1e-5, 1e-6] with
 PM-localized orbitals and compares three calculations:
 
   1. plain MP2 guess / plain LNO-DM   (baseline)
-  2. kappa-MP2 CC guess (regmp2_cc)    -- expected within ~1 mEh of baseline:
-     the converged CCSD energy should barely depend on the starting amplitudes.
-  3. kappa-MP2 LNO-DM  (regmp2_lno)    -- expected close, but possibly a little
-     further from baseline, since the selected active space is not identical.
+  2. kappa-MP2 CC guess (pt2_amp='kappa-mp2')    -- expected within ~1 mEh of
+     baseline: the converged CCSD energy should barely depend on the starting
+     amplitudes.
+  3. kappa-MP2 LNO-DM  (lno_amp='kappa-mp2', pt2_amp='mp2') -- expected close,
+     but possibly a little further from baseline, since the selected active
+     space is not identical.
 '''
 
 import numpy as np
@@ -53,20 +55,20 @@ def run(**kw):
     return mcc.e_corr_ccsd
 
 e_base = run()
-e_cc   = run(regmp2_cc=True)   # kappa-MP2 only for the CC guess / MP2 energy
-e_lno  = run(regmp2_lno=True)  # kappa-MP2 only for the LNO density matrices
+e_cc   = run(pt2_amp='kappa-mp2')                 # only the CC guess / MP2 energy
+e_lno  = run(lno_amp='kappa-mp2', pt2_amp='mp2')  # only the LNO density matrices
 
 print()
 print('LNO-CCSD correlation energy (water dimer, lno_thresh=%s, kappa=%.2f)'
       % (lno_thresh, kappa))
 print('  plain MP2 guess / plain LNO-DM : % .10f' % e_base)
-print('  kappa-MP2 CC guess (regmp2_cc) : % .10f  (dE = % .3e Eh)'
+print('  kappa-MP2 CC guess (pt2_amp)  : % .10f  (dE = % .3e Eh)'
       % (e_cc,  e_cc  - e_base))
-print('  kappa-MP2 LNO-DM  (regmp2_lno) : % .10f  (dE = % .3e Eh)'
+print('  kappa-MP2 LNO-DM  (lno_amp)  : % .10f  (dE = % .3e Eh)'
       % (e_lno, e_lno - e_base))
 print()
-print('Expectation: |dE(regmp2_cc)| < 1 mEh (CCSD is insensitive to its guess);')
-print('             regmp2_lno is also close but may differ a bit more, since')
+print('Expectation: |dE(pt2_amp)| < 1 mEh (CCSD is insensitive to its guess);')
+print('             lno_amp is also close but may differ a bit more, since')
 print('             the selected LNO active space is not exactly the same.')
 
 assert abs(e_cc - e_base) < 1e-3, 'kappa-MP2 CC guess changed CCSD by > 1 mEh'

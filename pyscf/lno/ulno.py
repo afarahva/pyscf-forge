@@ -81,7 +81,7 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
     ####################
     if lno_type[0] == lno_type[1] == '1h':
         # NOTE: uvir_loc is not used in 1h/1h, so we pass None
-        kappa = mlno.kappa if (mlno.regmp2 or mlno.regmp2_lno) else None
+        kappa = mlno.kappa if mlno._lno_amp == 'kappa-mp2' else None
         if getattr(mlno, 'with_df', None):
             dmoo, dmvv = make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc_loc, kappa=kappa)
         else:

@@ -118,13 +118,26 @@ class KLNO(LNO):
 
             return eris
 
+    @property
+    def _e_full_scale(self):
+        r''' Full-system (supercell) energies are reported per unit cell, matching the
+        fragment energies of one unit cell's fragments (and KMP2).
+        '''
+        return 1. / len(self.kpts)
+
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        if self._lno_uses_rpa:  # real drCCD amplitudes: use the molecular rdm1 code
+            return LNO.make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
+                                        occ_lno_type)
+        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
                                 kappa=kappa)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        kappa = self.kappa if (self.regmp2 or self.regmp2_lno) else None
+        if self._lno_uses_rpa:
+            return LNO.make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
+                                        vir_lno_type)
+        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
         return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
                                 kappa=kappa)
 
