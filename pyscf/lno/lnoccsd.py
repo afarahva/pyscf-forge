@@ -471,7 +471,7 @@ def _make_df_eris(cc, mo_coeff=None):
     return eris
 
 def _cp(a):
-    return np.array(a, copy=False, order='C')
+    return np.asarray(a, order='C')
 
 class MODIFIED_DFCCSD_complex:
     pass
