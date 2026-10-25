@@ -1,5 +1,6 @@
 import sys
 import numpy as np
+import scipy.linalg
 from functools import reduce
 
 from pyscf.pbc.df.df import _load3c
@@ -27,8 +28,14 @@ def is_trs_kmesh(cell, kpts):
     return bool(hasminus.all())
 
 
-def k2s_scf(kmf, fock_imag_tol=1e-6):
-    from pyscf.scf.hf import eig
+def k2s_scf(kmf, fock_imag_tol=1e-6, lindep_thresh=None):
+    r''' lindep_thresh: if given, solve the supercell eigenproblem by canonical orthogonalization,
+    dropping overlap eigenvectors with eigenvalue <= lindep_thresh (use the threshold the k-point
+    SCF used, e.g. pyscf.scf.hf.overlap_zero_eigenvalue_threshold). The supercell then has fewer
+    MOs than AOs, as a molecular SCF does after linear-dependency removal. If None, a plain
+    generalized eigh is used, which fails when the supercell overlap is numerically singular.
+    '''
+    from pyscf.scf.hf import eig, _adjust_phase_
     from pyscf.pbc import scf
 
     if not kmf.istype('KRHF'):
@@ -61,7 +68,17 @@ def k2s_scf(kmf, fock_imag_tol=1e-6):
     h1e = _k2s_aoint(cell, kh1e, kpts, phase, 'h1e')
     fock = _k2s_aoint(cell, kfock, kpts, phase, 'fock')
 
-    mo_energy, mo_coeff = eig(fock, s1e)
+    if lindep_thresh is None:
+        mo_energy, mo_coeff = eig(fock, s1e)
+    else:
+        se, sv = scipy.linalg.eigh(s1e)
+        keep = se > lindep_thresh
+        x = sv[:,keep] / np.sqrt(se[keep])
+        mo_energy, c = scipy.linalg.eigh(reduce(np.dot, (x.conj().T, fock, x)))
+        mo_coeff = _adjust_phase_(x.dot(c))
+        if keep.sum() < len(se):
+            sys.stderr.write('k2s_scf: %d small eigenvectors of the supercell overlap removed\n'
+                             % (len(se) - keep.sum()))
 
     if isinstance(dfobj, RSDF):
         mf = scf.RHF(scell, kpt=kpts[0]).rs_density_fit(auxbasis=dfobj.auxbasis)
