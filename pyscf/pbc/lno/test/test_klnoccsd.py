@@ -140,7 +140,7 @@ class ShiftedKmesh(unittest.TestCase):
         kmf.exxdiv = exxdiv
         return kmf.run(conv_tol=1e-11)
 
-    def _klno(self, kmf, smf=None, ccsd_t=True):
+    def _klno(self, kmf, smf=None, ccsd_t=True, **kwargs):
         if smf is None: smf = k2s_scf(kmf)
         kocc_coeff = [c[:,o>1e-6] for c,o in zip(kmf.mo_coeff, kmf.mo_occ)]
         lo_coeff = k2s_iao(self.cell, kocc_coeff, kmf.kpts, minao='sto-3g', orth=True)
@@ -148,6 +148,7 @@ class ShiftedKmesh(unittest.TestCase):
         mcc = (KLNOCCSD_T if ccsd_t else KLNOCCSD)(kmf, lo_coeff, frag_lolist, mf=smf)
         mcc.lno_thresh = [1e-100, 1e-100]
         mcc.kwargs_imp = {'conv_tol': 1e-10, 'conv_tol_normt': 1e-8}
+        mcc.set(**kwargs)
         mcc.kernel()
         return mcc, lo_coeff, frag_lolist
 
@@ -202,6 +203,27 @@ class ShiftedKmesh(unittest.TestCase):
                           ccsd_t=False)[0].e_corr_ccsd
                for exxdiv in ('ewald', None)]
         self.assertAlmostEqual(ecc[0], ecc[1], 7)
+
+    def test_klnoccsd_t_outcore(self):
+        ''' Outcore ovL for the LNO step, alone and with the DF impurity CCSD integrals
+            (vvL), against incore energies. The aux blocks are split and every q block is
+            zero padded (naux > naux_by_q) so the blocked and padded writes are exercised.
+        '''
+        from pyscf import lib
+        from pyscf.pbc.lno import klno, klnoccsd
+        from pyscf.pbc.lno import tools as ktools
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        # incore KLNO-CCSD(T): e_corr_pt2, e_corr_ccsd, e_corr_ccsd_t
+        ref = [-0.0334853473, -0.0482735652, -0.0483090353]
+        naux_pad = property(lambda k2sdf: k2sdf.get_naoaux().max() + 3)
+        for force_dfkcc in (False, True):
+            with lib.temporary_env(klno, DEBUG_BLKSIZE=True), \
+                 lib.temporary_env(klnoccsd, DEBUG_BLKSIZE=True, FORCE_DFKCC=force_dfkcc), \
+                 lib.temporary_env(ktools.K2SDF, naux=naux_pad):
+                mcc = self._klno(kmf, lno_thresh=[1e-5, 1e-6], force_outcore_ao2mo=True)[0]
+            self.assertAlmostEqual(mcc.e_corr_pt2, ref[0], 8)
+            self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 8)
+            self.assertAlmostEqual(mcc.e_corr_ccsd_t, ref[2], 8)
 
 
 
