@@ -99,11 +99,12 @@ class KLNO(LNO):
             nvir = orbvir.shape[1]
             # FIXME: more accurate mem estimate
             mem_now = self.max_memory - lib.current_memory()[0]
-            nkpts = len(self.kpts)
-            naux = self.with_df.get_naoaux()
+            # count q points and aux size exactly as the ERI classes do (on even meshes the
+            # zone-boundary q = -q points make the IBZ larger than nkpts//2+nkpts%2)
+            k2sdf = K2SDF(self.with_df)
             trs = is_trs_kmesh(self.unit_cell, self.kpts) and np.isrealobj(orbocc)
-            nk = nkpts//2+nkpts%2 if trs else nkpts
-            mem_df = nk*nocc*nvir*naux*dsize/1024**2.
+            nq = len(k2sdf.qpts_ibz) if trs else len(k2sdf.qpts)
+            mem_df = nq*nocc*nvir*k2sdf.naux*dsize/1024**2.
             log.debug('ao2mo est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
             if ( (self._ovL_to_save is not None) or (self._ovL is not None) or
                  self.force_outcore_ao2mo or (mem_df > min(mem_now*0.8, mem_now-2000)) ):
