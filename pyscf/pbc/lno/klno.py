@@ -107,7 +107,7 @@ class KLNO(LNO):
             mem_df = nq*nocc*nvir*k2sdf.naux*dsize/1024**2.
             log.debug('ao2mo est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
             if ( (self._ovL_to_save is not None) or (self._ovL is not None) or
-                 self.force_outcore_ao2mo or (mem_df > min(mem_now*0.8, mem_now-2000)) ):
+                 self.force_outcore_ao2mo or (mem_df > min(mem_now*0.75, mem_now-2000)) ):
                 eris = _KLNODFOUTCOREERIS(self.with_df, orbocc, orbvir, self.max_memory,
                                           ovL=self._ovL, ovL_to_save=self._ovL_to_save,
                                           verbose=self.verbose, stdout=self.stdout)
