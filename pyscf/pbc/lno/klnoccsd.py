@@ -319,9 +319,11 @@ def _make_df_eris(mycc, mo_coeff=None):
                                          chunks=(nocc,1,nvir,nocc))
     eris.oovv = eris.feri.create_dataset('oovv', (nocc,nocc,nvir,nvir), 'f8',
                                          chunks=(nocc,nocc,1,nvir))
-    # one q block (naux columns) per chunk so q-block writes fill whole chunks;
-    # nrow ~ 4e9/8/naux to ensure hdf5 chunk < 4GB
-    chunks = (min(nvir_pair,int(4e8/naux)), naux)
+    # one q block (naux columns) per chunk so q-block writes fill whole chunks; rows split
+    # evenly into chunks of <= 2.5e7 elements (200 MB), as hdf5 holds a whole chunk in memory
+    # when writing it and stores a partially filled last chunk at full size
+    nrow_chunks = max(1, int(np.ceil(nvir_pair*naux / 2.5e7)))
+    chunks = (int(np.ceil(nvir_pair / nrow_chunks)), naux)
     eris.vvLR = eris.feri.create_dataset('vvLR', (nvir_pair,Naux), 'f8', chunks=chunks)
     eris.vvLI = eris.feri.create_dataset('vvLI', (nvir_pair,Naux), 'f8', chunks=chunks)
 
