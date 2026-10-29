@@ -23,6 +23,7 @@ from pyscf.pbc.lno import KLNOCCSD, KLNOCCSD_T
 from pyscf.lno.tools import autofrag_iao
 from pyscf.pbc.lno.tools import k2s_scf, k2s_iao, is_trs_kmesh
 from pyscf import lo
+from pyscf.lno.test.test_lnoccsd import kernel_counted
 
 
 class WaterDimer(unittest.TestCase):
@@ -140,7 +141,7 @@ class ShiftedKmesh(unittest.TestCase):
         kmf.exxdiv = exxdiv
         return kmf.run(conv_tol=1e-11)
 
-    def _klno(self, kmf, smf=None, ccsd_t=True, **kwargs):
+    def _klno(self, kmf, smf=None, ccsd_t=True, run=None, **kwargs):
         if smf is None: smf = k2s_scf(kmf)
         kocc_coeff = [c[:,o>1e-6] for c,o in zip(kmf.mo_coeff, kmf.mo_occ)]
         lo_coeff = k2s_iao(self.cell, kocc_coeff, kmf.kpts, minao='sto-3g', orth=True)
@@ -149,7 +150,10 @@ class ShiftedKmesh(unittest.TestCase):
         mcc.lno_thresh = [1e-100, 1e-100]
         mcc.kwargs_imp = {'conv_tol': 1e-10, 'conv_tol_normt': 1e-8}
         mcc.set(**kwargs)
-        mcc.kernel()
+        if run is None:
+            mcc.kernel()
+        else:
+            run(mcc)
         return mcc, lo_coeff, frag_lolist
 
     def test_is_trs_kmesh(self):
@@ -224,6 +228,32 @@ class ShiftedKmesh(unittest.TestCase):
             self.assertAlmostEqual(mcc.e_corr_pt2, ref[0], 8)
             self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 8)
             self.assertAlmostEqual(mcc.e_corr_ccsd_t, ref[2], 8)
+
+    def test_klnoccsd_t_restart(self):
+        ''' Restart from the chkfile of an outcore run: fragment 0 reuses its LNOs,
+            fragment 1 is redone from scratch and the others are restored.
+        '''
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        smf = k2s_scf(kmf)
+        ref = [-0.0334853473, -0.0482735652, -0.0483090353]
+        calls = []
+        m1 = self._klno(kmf, smf, lno_thresh=[1e-5, 1e-6], force_outcore_ao2mo=True,
+                        run=lambda mcc: calls.append(kernel_counted(mcc)))[0]
+        nfrag = m1.nfrag
+        self.assertEqual(calls[0], {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
+        self.assertAlmostEqual(m1.e_corr_pt2, ref[0], 8)
+        self.assertAlmostEqual(m1.e_corr_ccsd, ref[1], 8)
+        self.assertAlmostEqual(m1.e_corr_ccsd_t, ref[2], 8)
+
+        def restart(mcc):
+            mcc.load_chk(m1.chkfile)
+            mcc.frag_eners[0] = None
+            mcc.frag_lno[1] = mcc.frag_eners[1] = None
+            calls.append(kernel_counted(mcc))
+        m2 = self._klno(kmf, smf, lno_thresh=[1e-5, 1e-6], run=restart)[0]
+        self.assertEqual(calls[1], {'ao2mo': 1, 'make_las': 1, 'impurity_solve': 2})
+        for key in ['efrag_pt2', 'efrag_cc', 'efrag_cc_t']:
+            self.assertAlmostEqual(abs(getattr(m2, key) - getattr(m1, key)).max(), 0, 9)
 
 
 

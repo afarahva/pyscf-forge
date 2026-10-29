@@ -20,6 +20,7 @@ from pyscf import gto, scf, mp, cc, lo
 from pyscf.cc.uccsd_t import kernel as CCSD_T
 from pyscf.lno import tools
 from pyscf.lno.ulnoccsd import ULNOCCSD_T
+from pyscf.lno.test.test_lnoccsd import kernel_counted
 
 
 class WaterDimer(unittest.TestCase):
@@ -108,15 +109,11 @@ class WaterDimer(unittest.TestCase):
             self.assertAlmostEqual(eccsd, ref[1], 6)
             self.assertAlmostEqual(eccsd_t, ref[2], 6)
 
-    def test_ulno_pm_outcore(self):
-        # outcore ovL for the LNO step with split occ/aux blocks against the incore
-        # thresh=2e-5 energies above (the impurity UCCSD integrals are always outcore with DF)
-        from pyscf import lib
-        from pyscf.lno import ulno
+    def _pm_lo_frag(self):
+        # PM localization per spin; every orbital is a fragment
         mol = self.mol
         mf = self.mf
         frozen = self.frozen
-
         lo_coeff = list()
         nocc = list()
         for s in range(2):
@@ -133,16 +130,51 @@ class WaterDimer(unittest.TestCase):
             lo_coeff.append(lo_coeff_s)
             nocc.append(orbocc.shape[1])
         frag_lolist = [[[i],[]] for i in range(nocc[0])] + [[[],[i]] for i in range(nocc[1])]
+        return lo_coeff, frag_lolist
+
+    def test_ulno_pm_outcore(self):
+        # outcore ovL for the LNO step with split occ/aux blocks against the incore
+        # thresh=2e-5 energies above (the impurity UCCSD integrals are always outcore with DF)
+        from pyscf import lib
+        from pyscf.lno import ulno
+        lo_coeff, frag_lolist = self._pm_lo_frag()
 
         ref = [-0.3995407761,-0.4185382023,-0.4231105742]
         with lib.temporary_env(ulno, DEBUG_BLKSIZE=True):
-            mcc = ULNOCCSD_T(mf, lo_coeff, frag_lolist, frozen=frozen).set(verbose=5)
+            mcc = ULNOCCSD_T(self.mf, lo_coeff, frag_lolist, frozen=self.frozen).set(verbose=5)
             mcc.force_outcore_ao2mo = True
             mcc.lno_thresh = [2e-4,2e-5]
             mcc.kernel()
         self.assertAlmostEqual(mcc.e_corr_pt2, ref[0], 6)
         self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 6)
         self.assertAlmostEqual(mcc.e_corr_ccsd_t, ref[2], 6)
+
+    def test_ulno_restart(self):
+        # restart from the chkfile with the alpha fragments' energies and one beta
+        # fragment's LNOs and energies removed: the per-spin LNOs are reused for the alpha
+        # fragments and only the beta fragment's LNOs are rebuilt
+        lo_coeff, frag_lolist = self._pm_lo_frag()
+        nfrag = len(frag_lolist)
+        nfraga = sum(len(f[0]) > 0 for f in frag_lolist)
+        def make():
+            mcc = ULNOCCSD_T(self.mf, lo_coeff, frag_lolist, frozen=self.frozen).set(verbose=5)
+            mcc.lno_thresh = [2e-4,2e-5]
+            return mcc
+
+        ref = [-0.3995407761,-0.4185382023,-0.4231105742]
+        m1 = make()
+        calls = kernel_counted(m1)
+        self.assertEqual(calls, {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
+        self.assertAlmostEqual(m1.e_corr_ccsd_t, ref[2], 6)
+
+        m2 = make().load_chk(m1.chkfile)
+        for i in range(nfraga):
+            m2.frag_eners[i] = None
+        m2.frag_lno[-1] = m2.frag_eners[-1] = None
+        calls = kernel_counted(m2)
+        self.assertEqual(calls, {'ao2mo': 1, 'make_las': 1, 'impurity_solve': nfraga+1})
+        for key in ['efrag_pt2', 'efrag_cc', 'efrag_cc_t']:
+            self.assertAlmostEqual(abs(getattr(m2, key) - getattr(m1, key)).max(), 0, 9)
 
 
 if __name__ == "__main__":

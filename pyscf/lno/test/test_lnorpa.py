@@ -204,6 +204,25 @@ class WaterDimerRPA(unittest.TestCase):
         self.assertLess(errs[1], 5e-4)
         self.assertLess(errs[1], errs[0])
 
+    def test_lno_sosex_restart(self):
+        # the full-system drCCD energies are restored from the chkfile, so a restart with
+        # all LNOs saved does not solve drCCD again; the integrals are only rebuilt for the
+        # SOSEX energy of the fragment whose energies were removed
+        from unittest import mock
+        from pyscf.lno.test.test_lnoccsd import kernel_counted
+        thresh = [1e-4, 1e-5]
+        m1 = self._lno(lno_thresh=thresh, lno_amp='sosex')
+        m1.kernel()
+        m2 = self._lno(lno_thresh=thresh, lno_amp='sosex').load_chk(m1.chkfile)
+        m2.frag_eners[0] = None
+        with mock.patch.object(m2, 'solve_rpa', side_effect=AssertionError('drCCD solved')):
+            calls = kernel_counted(m2)
+        self.assertEqual(calls, {'ao2mo': 1, 'make_las': 0, 'impurity_solve': 1})
+        self.assertEqual(m2.e_corr_rpa_full, m1.e_corr_rpa_full)
+        self.assertEqual(m2.e_corr_sosex_full, m1.e_corr_sosex_full)
+        for key in ['efrag_pt2', 'efrag_cc']:
+            self.assertAlmostEqual(abs(getattr(m2, key) - getattr(m1, key)).max(), 0, 9)
+
 
 if __name__ == "__main__":
     print("Full Tests for LNO-CCSD with RPA (drCCD) amplitudes")

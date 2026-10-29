@@ -195,6 +195,85 @@ class WaterDimer(unittest.TestCase):
         self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 6)
         self.assertAlmostEqual(mcc.e_corr_ccsd_t, ref[2], 6)
 
+    def test_lno_restart(self):
+        # LNOCCSD saves its LNOs and energies to the chkfile; LNOCCSD_T restarted from it
+        # only adds (T), then a restart with some fragments' LNOs/energies missing redoes
+        # just those fragments
+        mol = self.mol
+        mf = self.mf
+        frozen = self.frozen
+
+        orbocc = mf.mo_coeff[:,frozen:np.count_nonzero(mf.mo_occ)]
+        iao_coeff = lo.iao.iao(mol, orbocc)
+        lo_coeff = lo.orth.vec_lowdin(iao_coeff, mf.get_ovlp())
+        frag_lolist = autofrag_iao(lo.iao.reference_mol(mol))
+        nfrag = len(frag_lolist)
+
+        ref = [-0.4054784012,-0.4240686326,-0.4303996712]
+        def make(cls):
+            mcc = cls(mf, lo_coeff, frag_lolist, frozen=frozen).set(verbose=5)
+            mcc.lno_thresh = [1e-4,1e-5]
+            return mcc
+
+        m1 = make(LNOCCSD)
+        calls = kernel_counted(m1)
+        self.assertEqual(calls, {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
+        self.assertAlmostEqual(m1.e_corr_pt2, ref[0], 6)
+        self.assertAlmostEqual(m1.e_corr_ccsd, ref[1], 6)
+
+        # the (T) energies are missing: all impurity problems redone with the saved LNOs
+        m2 = make(LNOCCSD_T).load_chk(m1.chkfile)
+        calls = kernel_counted(m2)
+        self.assertEqual(calls, {'ao2mo': 0, 'make_las': 0, 'impurity_solve': nfrag})
+        self.assertAlmostEqual(m2.e_corr_pt2, m1.e_corr_pt2, 9)
+        self.assertAlmostEqual(m2.e_corr_ccsd, m1.e_corr_ccsd, 9)
+        self.assertAlmostEqual(m2.e_corr_ccsd_t, ref[2], 6)
+
+        # continue in m2's chkfile with fragment 0 missing energies, 1 missing LNOs,
+        # 2 missing both, and 3 missing E(T)
+        m3 = make(LNOCCSD_T)
+        m3.chkfile = m2.chkfile
+        m3.load_chk()
+        m3.frag_eners[0] = None
+        m3.frag_lno[1] = None
+        m3.frag_eners[2] = m3.frag_lno[2] = None
+        del m3.frag_eners[3]['e_ccsd_t']
+        calls = kernel_counted(m3)
+        self.assertEqual(calls, {'ao2mo': 1, 'make_las': 1, 'impurity_solve': 3})
+        for key in ['efrag_pt2', 'efrag_cc', 'efrag_cc_t', 'efrag_cc_spin_comp']:
+            self.assertAlmostEqual(abs(getattr(m3, key) - getattr(m2, key)).max(), 0, 9)
+
+        # everything is in the chkfile now
+        m4 = make(LNOCCSD_T).load_chk(m2.chkfile)
+        calls = kernel_counted(m4)
+        self.assertEqual(calls, {'ao2mo': 0, 'make_las': 0, 'impurity_solve': 0})
+        self.assertAlmostEqual(m4.e_corr_ccsd_t, m2.e_corr_ccsd_t, 12)
+
+
+def kernel_counted(mcc):
+    ''' mcc.kernel() with the calls of ao2mo, make_las and impurity_solve counted. Checks
+        that the integrals for the LNOs are released before the impurity problems unless
+        they are kept for them (mcc._keep_lno_eris).
+    '''
+    import weakref
+    calls = dict.fromkeys(['ao2mo', 'make_las', 'impurity_solve'], 0)
+    eris_refs = []
+    def wrap(name):
+        fn = getattr(mcc, name)
+        def wrapped(*args, **kwargs):
+            calls[name] += 1
+            if name == 'impurity_solve' and not mcc._keep_lno_eris:
+                assert all(ref() is None for ref in eris_refs), 'LNO integrals not released'
+            out = fn(*args, **kwargs)
+            if name == 'ao2mo':
+                eris_refs.append(weakref.ref(out))
+            return out
+        return wrapped
+    for name in calls:
+        setattr(mcc, name, wrap(name))
+    mcc.kernel()
+    return calls
+
 
 if __name__ == "__main__":
     print("Full Tests for LNO-CCSD and LNO-CCSD(T)")

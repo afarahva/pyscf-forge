@@ -796,6 +796,32 @@ class LNOCCSD(LNO):
         self.efrag_pt2_spin_comp  = efrag_pt2_spin_comp  * frag_wghtlist[:,None]
         self.efrag_cc_spin_comp   = efrag_cc_spin_comp   * frag_wghtlist[:,None]
 
+    def _frag_res_to_dict(self, frag_res):
+        r''' Fragment energies (unweighted) for the chkfile and `frag_eners`: e_pt2,
+        e_ccsd, their spin components, and e_ccsd_t if computed.
+        '''
+        ept2, ecc, ecc_t = frag_res
+        dic = {'e_pt2': float(ept2), 'e_pt2_spin_comp': np.asarray(ept2.spin_comp),
+               'e_ccsd': float(ecc), 'e_ccsd_spin_comp': np.asarray(ecc.spin_comp)}
+        if self.ccsd_t:
+            dic['e_ccsd_t'] = float(ecc_t)
+        return dic
+
+    def _frag_res_from_dict(self, dic):
+        r''' Inverse of `_frag_res_to_dict`. None if e_pt2, e_ccsd or (if requested)
+        e_ccsd_t is missing; missing spin components are NaN.
+        '''
+        keys = ['e_pt2', 'e_ccsd'] + (['e_ccsd_t'] if self.ccsd_t else [])
+        if any(dic.get(key) is None for key in keys):
+            return None
+        nan = np.full(2, np.nan)
+        ept2 = lib.tag_array(float(dic['e_pt2']),
+                             spin_comp=np.asarray(dic.get('e_pt2_spin_comp', nan)))
+        ecc = lib.tag_array(float(dic['e_ccsd']),
+                            spin_comp=np.asarray(dic.get('e_ccsd_spin_comp', nan)))
+        ecc_t = float(dic['e_ccsd_t']) if self.ccsd_t else 0.
+        return ept2, ecc, ecc_t
+
     def _finalize(self):
         r''' Hook for dumping results and clearing up the object.'''
         logger.note(self, 'E(%s) = %.15g  E_corr = %.15g',

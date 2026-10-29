@@ -28,6 +28,7 @@
         Ye and Berkelbach, J. Chem. Theory Comput. 2024, 20, 20, 8948–8959
 '''
 
+import os
 import sys
 import numbers
 from collections.abc import Iterable
@@ -52,13 +53,21 @@ einsum = lib.einsum
 DEBUG_BLKSIZE = getattr(__config__, 'lnocc_DEBUG_BLKSIZE', False)
 
 
-r''' TODO's
-[ ] chkfile / restart
-'''
+MUTE_CHKFILE = getattr(__config__, 'lno_LNO_mute_chkfile', False)
+
 
 def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=None,
            lno_norb=None, eris=None):
     r''' Kernel function for LNO-based methods.
+
+    The LNO active spaces of all fragments are built first, then all impurity problems
+    are solved. The full-system integrals used for the LNOs (`eris`) are released in
+    between unless the impurity problems need them (see `LNO._keep_lno_eris`).
+
+    Fragments whose LNOs (`mlno.frag_lno`) or energies (`mlno.frag_eners`) are already
+    known, e.g. from `mlno.load_chk`, are not recomputed: a fragment with energies is
+    skipped, and a fragment with LNOs only has its impurity problem solved. Both are
+    saved to `mlno.chkfile` as each fragment finishes.
 
     Args:
         lo_coeff (np.ndarray):
@@ -87,42 +96,66 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
     cput0 = (logger.process_clock(), logger.perf_counter())
 
-    if eris is None: eris = mlno.ao2mo()
+    # restart data
+    frag_lno = [None] * nfrag if mlno.frag_lno is None else list(mlno.frag_lno)
+    frag_eners = [None] * nfrag if mlno.frag_eners is None else list(mlno.frag_eners)
+    if len(frag_lno) != nfrag or len(frag_eners) != nfrag:
+        log.error('frag_lno and frag_eners must have one entry per fragment (%d).', nfrag)
+        raise ValueError
+    frag_res = [None] * nfrag
+    for ifrag,dic in enumerate(frag_eners):
+        if dic is not None:
+            frag_res[ifrag] = mlno._frag_res_from_dict(dic)
+            if frag_res[ifrag] is None:
+                log.info('Fragment %d/%d  energies incomplete; the fragment is recomputed',
+                         ifrag+1, nfrag)
+    mlno._chk_init(lo_coeff, frag_lolist, frag_lno, frag_eners)
+
+    # full-system low-level amplitudes; the LNOs below solve these themselves if needed
+    frag_todo_las = [ifrag for ifrag in range(nfrag)
+                     if frag_res[ifrag] is None and frag_lno[ifrag] is None]
+    need_rpa = ((mlno._lno_uses_rpa or mlno._pt2_uses_rpa) and
+                (mlno.e_corr_rpa_full is None or
+                 (mlno._pt2_amp == 'sosex' and mlno.e_corr_sosex_full is None)))
+    need_bws2 = ('bws2' in (mlno._lno_amp, mlno._pt2_amp) and mlno.e_corr_bws2_full is None)
+    if frag_todo_las or need_rpa or need_bws2:
+        if eris is None: eris = mlno.ao2mo()
+        if need_rpa: mlno.solve_rpa(eris)
+        if need_bws2: mlno.solve_bws2(eris)
+        mlno._chk_dump_full()
 
     cput2 = cput1 = (logger.process_clock(), logger.perf_counter())
 
-    # Loop over fragment
-    frag_res = [None] * nfrag
-    for ifrag,loidx in enumerate(frag_lolist):
-        if len(loidx) == 2 and isinstance(loidx[0], Iterable): # Unrestricted
-            orbloc = [lo_coeff[0][:,loidx[0]], lo_coeff[1][:,loidx[1]]]
-            lno_param = [
-                [
-                    {
-                        'thresh': (
-                            lno_thresh[i][s] if isinstance(lno_thresh[i], Iterable)
-                            else lno_thresh[i]
-                        ),
-                        'pct_occ': (
-                            lno_pct_occ[i][s] if isinstance(lno_pct_occ[i], Iterable)
-                            else lno_pct_occ[i]
-                        ),
-                        'norb': (
-                            lno_norb[ifrag][i][s] if isinstance(lno_norb[ifrag][i], Iterable)
-                            else lno_norb[ifrag][i]
-                        ),
-                    } for i in [0, 1]
-                ] for s in range(2)
-            ]
-
-        else:
-            orbloc = lo_coeff[:,loidx]
-            lno_param = [{'thresh': lno_thresh[i], 'pct_occ': lno_pct_occ[i],
-                          'norb': lno_norb[ifrag][i]} for i in [0,1]]
+    # Step 1: LNO active spaces of all fragments
+    for ifrag in frag_todo_las:
+        orbloc, lno_param = _frag_orbloc(lo_coeff, frag_lolist[ifrag], ifrag, lno_thresh,
+                                         lno_pct_occ, lno_norb)
 
         lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(eris, orbloc, lno_type, lno_param)
+        frag_lno[ifrag] = mlno._pack_las(lnofrag, frozen)
+        mlno._chk_dump_frag(ifrag, 'las', dict(orbloc=orbloc, **frag_lno[ifrag]))
         cput2 = log.timer('Fragment %d make las'%(ifrag+1), *cput2)
         log.info('Fragment %d/%d  LAS: %s', ifrag+1, nfrag, frag_msg)
+    lnofrag = frozen = uocc_loc = None
+
+    # the integrals for the LNOs, and the dressed ones of BW-s2, are not needed anymore
+    mlno._bws2 = None
+    if not mlno._keep_lno_eris:
+        if eris is not None:
+            log.info('Releasing the full-system integrals used for the LNOs')
+        eris = None
+
+    # Step 2: impurity problems of all fragments
+    for ifrag,loidx in enumerate(frag_lolist):
+        if frag_res[ifrag] is not None:
+            log.info('Fragment %d/%d  Sol: restored', ifrag+1, nfrag)
+            continue
+
+        orbloc = _frag_orbloc(lo_coeff, loidx, ifrag)[0]
+        lnofrag, frozen, uocc_loc = mlno._unpack_las(frag_lno[ifrag], orbloc)
+
+        # the RPA/SOSEX fragment energies project the full-system integrals
+        if eris is None and mlno._pt2_uses_rpa: eris = mlno.ao2mo()
 
         # calculate domains/prune basis
         if mlno.prune_lno_basis:
@@ -148,6 +181,8 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
         # solve impurity problem
         frag_res[ifrag], frag_msg = mlno.impurity_solve(mf_frag, lnofrag, uocc_loc, eris, frozen=frozen)
+        frag_eners[ifrag] = mlno._frag_res_to_dict(frag_res[ifrag])
+        mlno._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
         cput2 = log.timer('Fragment %d imp sol '%(ifrag+1), *cput2)
         log.info('Fragment %d/%d  Sol: %s', ifrag+1, nfrag, frag_msg)
         cput1 = log.timer('Fragment %d'%(ifrag+1)+' '*(8-len(str(ifrag+1))), *cput1)
@@ -166,6 +201,85 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
     cput0 = log.timer(classname+' '*(17-len(classname)), *cput0)
 
     return frag_res
+
+def _frag_orbloc(lo_coeff, loidx, ifrag, lno_thresh=None, lno_pct_occ=None, lno_norb=None):
+    r''' LOs of a fragment and, if `lno_thresh` is given, its LNO truncation parameters. '''
+    if len(loidx) == 2 and isinstance(loidx[0], Iterable): # Unrestricted
+        orbloc = [lo_coeff[0][:,loidx[0]], lo_coeff[1][:,loidx[1]]]
+        if lno_thresh is None:
+            return orbloc, None
+        lno_param = [
+            [
+                {
+                    'thresh': (
+                        lno_thresh[i][s] if isinstance(lno_thresh[i], Iterable)
+                        else lno_thresh[i]
+                    ),
+                    'pct_occ': (
+                        lno_pct_occ[i][s] if isinstance(lno_pct_occ[i], Iterable)
+                        else lno_pct_occ[i]
+                    ),
+                    'norb': (
+                        lno_norb[ifrag][i][s] if isinstance(lno_norb[ifrag][i], Iterable)
+                        else lno_norb[ifrag][i]
+                    ),
+                } for i in [0, 1]
+            ] for s in range(2)
+        ]
+
+    else:
+        orbloc = lo_coeff[:,loidx]
+        if lno_thresh is None:
+            return orbloc, None
+        lno_param = [{'thresh': lno_thresh[i], 'pct_occ': lno_pct_occ[i],
+                      'norb': lno_norb[ifrag][i]} for i in [0,1]]
+    return orbloc, lno_param
+
+def split_las(orbfrag, frozen, nocc):
+    r''' Active occupied and virtual LNOs of an LAS returned by `make_las`, whose first
+    `nocc` columns are the (frozen and active) occupied orbitals.
+    '''
+    nmo = orbfrag.shape[1]
+    maskact = np.ones(nmo, dtype=bool)
+    if isinstance(frozen, numbers.Integral):
+        maskact[:frozen] = False
+    else:
+        maskact[np.asarray(frozen, dtype=int)] = False
+    maskocc = np.arange(nmo) < nocc
+    return orbfrag[:,maskact&maskocc], orbfrag[:,maskact&~maskocc]
+
+def join_las(lno_occ, lno_vir, mo_coeff, mo_occ, s1e, orbloc):
+    r''' Inverse of `split_las`: the LAS (orbfrag, frozen, uocc_loc) as returned by
+    `make_las` from the active occupied and virtual LNOs. The frozen orbitals are the
+    complements of the LNOs in the occupied and virtual MO spaces; any rotation among
+    them gives the same impurity problem.
+    '''
+    maskocc = mo_occ > 1e-10
+    orboccfrz = _orth_complement(mo_coeff[:,maskocc], lno_occ, s1e)
+    orbvirfrz = _orth_complement(mo_coeff[:,~maskocc], lno_vir, s1e)
+    orbfragall = [orboccfrz, lno_occ, lno_vir, orbvirfrz]
+    orbfrag = np.hstack(orbfragall)
+    locfragall = np.cumsum([0] + [x.shape[1] for x in orbfragall]).astype(int)
+    frzfrag = np.concatenate((
+        np.arange(locfragall[0], locfragall[1]),
+        np.arange(locfragall[3], locfragall[4]))).astype(int)
+    if len(frzfrag) == 0:
+        frzfrag = 0
+    uoccact_loc = np.linalg.multi_dot((lno_occ.T.conj(), s1e, orbloc))
+    return orbfrag, frzfrag, uoccact_loc
+
+def _orth_complement(orb, orbact, s1e):
+    r''' Orbitals spanning the complement of `orbact` within the space of `orb`. '''
+    nact = orbact.shape[1]
+    if nact == 0:
+        return orb
+    u = np.linalg.multi_dot((orb.T.conj(), s1e, orbact))
+    return np.dot(orb, np.linalg.svd(u)[0][:,nact:])
+
+def _same_orbloc(orbloc1, orbloc2):
+    if isinstance(orbloc2, (list, tuple)):    # Unrestricted
+        return all(_same_orbloc(x1, x2) for x1,x2 in zip(orbloc1, orbloc2))
+    return np.shape(orbloc1) == np.shape(orbloc2) and np.allclose(orbloc1, orbloc2, atol=1e-8)
 
 
 def make_las(mlno, eris, orbloc, lno_type, lno_param):
@@ -407,6 +521,26 @@ class LNO(lib.StreamObject):
         self._ovL_to_save = None
         self.force_outcore_ao2mo = False
 
+        # checkpoint and restart
+        #   chkfile    : the LOs and LNOs of each fragment are saved as they are built,
+        #                and its energies as its impurity problem is solved. As for SCF,
+        #                the default file is removed with the object; assign a filename
+        #                to keep it.
+        #   frag_lno   : restart input, per fragment None or its active LNOs
+        #                {'lno_occ', 'lno_vir'} (lists over spin for ULNO); given LNOs
+        #                are not rebuilt
+        #   frag_eners : restart input, per fragment None or its energies (see
+        #                `_frag_res_to_dict`); fragments with complete energies are skipped
+        #   `load_chk` sets both from a chkfile.
+        if MUTE_CHKFILE:
+            self.chkfile = None
+        else:
+            self._chkfile = lib.NamedTemporaryFile(dir=lib.param.TMPDIR)
+            self.chkfile = self._chkfile.name
+        self.frag_lno = None
+        self.frag_eners = None
+        self._chk_loaded = None
+
         # reverse compatibility
         self._match_oldcode = False # if True, MP2 dm for LNO generation is multiplied by 0.5
 
@@ -485,6 +619,11 @@ class LNO(lib.StreamObject):
         log.info('_ovL = %s', self._ovL)
         log.info('_ovL_to_save = %s', self._ovL_to_save)
         log.info('force_outcore_ao2mo = %s', self.force_outcore_ao2mo)
+        log.info('chkfile = %s', self.chkfile)
+        if self.frag_lno is not None or self.frag_eners is not None:
+            log.info('restart: LNOs of %d and energies of %d fragments given',
+                     sum(x is not None for x in (self.frag_lno or [])),
+                     sum(x is not None for x in (self.frag_eners or [])))
         log.info('_match_oldcode = %s', self._match_oldcode)
         log.info('lno_amp = %s  pt2_amp = %s', self._lno_amp, self._pt2_amp)
         if 'kappa-mp2' in (self._lno_amp, self._pt2_amp):
@@ -535,12 +674,7 @@ class LNO(lib.StreamObject):
 
         self._precompute()
 
-        if self._lno_uses_rpa or self._pt2_uses_rpa:
-            if eris is None: eris = self.ao2mo()
-            self.solve_rpa(eris)
-        if 'bws2' in (self._lno_amp, self._pt2_amp):
-            if eris is None: eris = self.ao2mo()
-            self.solve_bws2(eris)
+        # the full-system RPA and BW-s2 problems are solved in `kernel`
 
         frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
                           self.lno_type, self.lno_thresh,
@@ -733,6 +867,102 @@ class LNO(lib.StreamObject):
     def nmo(self):
         return self.get_nmo()
 
+    @property
+    def _keep_lno_eris(self):
+        r''' Whether the full-system integrals used for the LNOs are kept for the impurity
+        problems: when they are read from or saved to a file (`_ovL`, `_ovL_to_save`), with
+        domains (`prune_lno_basis`), or with the RPA/SOSEX amplitudes.
+        '''
+        return (self._ovL is not None or self._ovL_to_save is not None or
+                self.prune_lno_basis or self._lno_uses_rpa or self._pt2_uses_rpa)
+
+    def _pack_las(self, lnofrag, frozen):
+        r''' Active LNOs {'lno_occ', 'lno_vir'} of an LAS returned by `make_las`. '''
+        mo_occ = self.mo_occ
+        if np.ndim(mo_occ) == 1:
+            lno_occ, lno_vir = split_las(lnofrag, frozen, np.count_nonzero(mo_occ > 1e-10))
+        else:
+            lno_occ, lno_vir = [list(x) for x in zip(*[
+                split_las(lnofrag[s], frozen[s], np.count_nonzero(mo_occ[s] > 1e-10))
+                for s in range(2)])]
+        return {'lno_occ': lno_occ, 'lno_vir': lno_vir}
+
+    def _unpack_las(self, las, orbloc):
+        r''' The LAS (orbfrag, frozen, uocc_loc) as returned by `make_las` from the active
+        LNOs `las` of a fragment with LOs `orbloc`.
+        '''
+        orbloc_las = las.get('orbloc')
+        if orbloc_las is not None and not _same_orbloc(orbloc_las, orbloc):
+            logger.warn(self, 'The LOs saved with the LNOs differ from those of the fragment.')
+        mo_coeff, mo_occ, s1e = self.mo_coeff, self.mo_occ, self.s1e
+        if np.ndim(mo_occ) == 1:
+            return join_las(las['lno_occ'], las['lno_vir'], mo_coeff, mo_occ, s1e, orbloc)
+        return tuple(list(x) for x in zip(*[
+            join_las(las['lno_occ'][s], las['lno_vir'][s], mo_coeff[s], mo_occ[s], s1e,
+                     orbloc[s]) for s in range(2)]))
+
+    def _chk_init(self, lo_coeff, frag_lolist, frag_lno, frag_eners):
+        r''' Start the chkfile of a `kernel` run with the restart data it is given. '''
+        chkfile = self.chkfile
+        if not chkfile:
+            return
+        if self._chk_loaded != os.path.abspath(chkfile):
+            # a chkfile of another calculation: replace its LNO data
+            if h5py.is_hdf5(chkfile):
+                with h5py.File(chkfile, 'r+') as f:
+                    if 'lno' in f:
+                        del f['lno']
+            self._chk_dump_full()
+            for ifrag,loidx in enumerate(frag_lolist):
+                if frag_lno[ifrag] is not None:
+                    orbloc = _frag_orbloc(lo_coeff, loidx, ifrag)[0]
+                    self._chk_dump_frag(ifrag, 'las',
+                                        dict(orbloc=orbloc, lno_occ=frag_lno[ifrag]['lno_occ'],
+                                             lno_vir=frag_lno[ifrag]['lno_vir']))
+                self._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
+        lib.chkfile.dump(chkfile, 'lno/nfrag', len(frag_lolist))
+
+    def _chk_dump_frag(self, ifrag, key, value):
+        if self.chkfile and value is not None:
+            lib.chkfile.dump(self.chkfile, 'lno/frag%d/%s' % (ifrag, key), value)
+
+    def _chk_dump_full(self):
+        if self.chkfile:
+            for key in ('e_corr_bws2_full', 'e_corr_rpa_full', 'e_corr_sosex_full'):
+                if getattr(self, key) is not None:
+                    lib.chkfile.dump(self.chkfile, 'lno/'+key, getattr(self, key))
+
+    def load_chk(self, chkfile=None):
+        r''' Restart from a chkfile written by `kernel` (default: `self.chkfile`).
+
+        Sets `frag_lno` and `frag_eners` from the LNOs and energies of the fragments that
+        finished, and the full-system energies (`e_corr_bws2_full`, `e_corr_rpa_full`,
+        `e_corr_sosex_full`) that were computed, so that the next `kernel` call only
+        computes what is missing. If `self.chkfile` is the same file, the run continues
+        writing to it.
+        '''
+        if chkfile is None: chkfile = self.chkfile
+        dat = lib.chkfile.load(chkfile, 'lno')
+        if dat is None:
+            raise KeyError('No LNO data in chkfile %s' % chkfile)
+        nfrag = int(dat['nfrag'])
+        if nfrag != self.nfrag:
+            logger.error(self, 'chkfile %s has %d fragments (expecting %d).',
+                         chkfile, nfrag, self.nfrag)
+            raise ValueError
+        self.frag_lno = [None] * nfrag
+        self.frag_eners = [None] * nfrag
+        for ifrag in range(nfrag):
+            frag = dat.get('frag%d' % ifrag)
+            if frag is not None:
+                self.frag_lno[ifrag] = frag.get('las')
+                self.frag_eners[ifrag] = frag.get('energy')
+        for key in ('e_corr_bws2_full', 'e_corr_rpa_full', 'e_corr_sosex_full'):
+            if key in dat:
+                setattr(self, key, float(dat[key]))
+        self._chk_loaded = os.path.abspath(chkfile)
+        return self
+
     ''' The following methods need to be implemented for derived LNO classes.
     '''
     def impurity_solve(self, mf, mo_coeff, uocc_loc, eris=None, frozen=None, log=None):
@@ -746,6 +976,16 @@ class LNO(lib.StreamObject):
 
     def _finalize(self):
         pass
+
+    def _frag_res_to_dict(self, frag_res):
+        r''' A fragment result of `impurity_solve` as a dict of numbers/arrays for the
+        chkfile and `frag_eners`, or None to not save it.
+        '''
+        return None
+
+    def _frag_res_from_dict(self, dic):
+        r''' Inverse of `_frag_res_to_dict`; None if `dic` is incomplete. '''
+        return None
 
 
 class _LNODFINCOREERIS:
