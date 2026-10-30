@@ -96,22 +96,17 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
     cput0 = (logger.process_clock(), logger.perf_counter())
 
-    # restart data
-    frag_lno = [None] * nfrag if mlno.frag_lno is None else list(mlno.frag_lno)
-    frag_eners = [None] * nfrag if mlno.frag_eners is None else list(mlno.frag_eners)
-    if len(frag_lno) != nfrag or len(frag_eners) != nfrag:
-        log.error('frag_lno and frag_eners must have one entry per fragment (%d).', nfrag)
-        raise ValueError
-    frag_res = [None] * nfrag
-    for ifrag,dic in enumerate(frag_eners):
-        if dic is not None:
-            frag_res[ifrag] = mlno._frag_res_from_dict(dic)
-            if frag_res[ifrag] is None:
-                log.info('Fragment %d/%d  energies incomplete; the fragment is recomputed',
-                         ifrag+1, nfrag)
-    mlno._chk_init(lo_coeff, frag_lolist, frag_lno, frag_eners)
+    # Whether the full-system integrals are built inside this call. Only such eris are torn
+    # down below; an eris passed in by the caller is left intact so it can be reused across
+    # calls (e.g. one ao2mo build shared by per-fragment `kernel(eris=eris)` runs).
+    eris_created_here = eris is None
 
-    # full-system low-level amplitudes; the LNOs below solve these themselves if needed
+    # Restart: unpack `mlno.frag_lno` / `mlno.frag_eners` and seed the chkfile.
+    frag_lno, frag_eners, frag_res = mlno._restart_frags(lo_coeff, frag_lolist)
+
+    # Fragments that still need their LNOs built, and whether the full-system low-level
+    # amplitudes (RPA / BW-s2) still need solving. The integrals are transformed once, here,
+    # if anything below needs them; the per-fragment LNOs would otherwise solve for them.
     frag_todo_las = [ifrag for ifrag in range(nfrag)
                      if frag_res[ifrag] is None and frag_lno[ifrag] is None]
     need_rpa = ((mlno._lno_uses_rpa or mlno._pt2_uses_rpa) and
@@ -126,7 +121,7 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
     cput2 = cput1 = (logger.process_clock(), logger.perf_counter())
 
-    # Step 1: LNO active spaces of all fragments
+    # Phase 1: build the LNO active space of every fragment that needs one.
     for ifrag in frag_todo_las:
         orbloc, lno_param = _frag_orbloc(lo_coeff, frag_lolist[ifrag], ifrag, lno_thresh,
                                          lno_pct_occ, lno_norb)
@@ -138,14 +133,19 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
         log.info('Fragment %d/%d  LAS: %s', ifrag+1, nfrag, frag_msg)
     lnofrag = frozen = uocc_loc = None
 
-    # the integrals for the LNOs, and the dressed ones of BW-s2, are not needed anymore
+    # The LNOs are built; the integrals that built them (and BW-s2's dressed ones) are no
+    # longer needed unless the impurity problems reuse them (`_keep_lno_eris`). Free them
+    # now, before those problems write their own integrals to disk. Only an eris built here
+    # is torn down in place (its scratch file closed); a caller's eris is left for reuse.
     mlno._bws2 = None
     if not mlno._keep_lno_eris:
         if eris is not None:
             log.info('Releasing the full-system integrals used for the LNOs')
+            if eris_created_here:
+                _release_eris(eris)
         eris = None
 
-    # Step 2: impurity problems of all fragments
+    # Phase 2: solve each fragment's impurity problem (skipping ones restored from chkfile).
     for ifrag,loidx in enumerate(frag_lolist):
         if frag_res[ifrag] is not None:
             log.info('Fragment %d/%d  Sol: restored', ifrag+1, nfrag)
@@ -280,6 +280,22 @@ def _same_orbloc(orbloc1, orbloc2):
     if isinstance(orbloc2, (list, tuple)):    # Unrestricted
         return all(_same_orbloc(x1, x2) for x1,x2 in zip(orbloc1, orbloc2))
     return np.shape(orbloc1) == np.shape(orbloc2) and np.allclose(orbloc1, orbloc2, atol=1e-8)
+
+def _release_eris(eris):
+    r''' Free the full-system integrals used to build the LNOs. Any HDF5 file backing an
+    outcore eris is closed (and, when it is a scratch file, deleted) so that both its memory
+    and its disk space are reclaimed before the impurity problems run, rather than waiting
+    on garbage collection. Only called when the eris are a temporary not needed again (see
+    `LNO._keep_lno_eris`).
+    '''
+    feri = getattr(eris, 'feri', None)
+    if feri is not None:
+        try:
+            feri.close()
+        except Exception:
+            pass
+        eris.feri = None
+    eris.ovL = None
 
 
 def make_las(mlno, eris, orbloc, lno_type, lno_param):
@@ -716,6 +732,60 @@ class LNO(lib.StreamObject):
 
             return eris
 
+    def make_lno_active_space(self, ifrag=None, eris=None):
+        r''' Build the LNO active space of one or more fragments, without solving their
+        impurity problems.
+
+        This runs only the LNO-construction half of `kernel`, returning each fragment's
+        active local natural orbitals in the same packed form as an entry of `frag_lno`:
+        a dict {'lno_occ', 'lno_vir'} of AO-basis coefficient matrices (lists over spin
+        for unrestricted methods). It is meant for inspecting or debugging the active
+        spaces, and for populating `frag_lno` by hand, e.g.
+
+            mlno.frag_lno = mlno.make_lno_active_space()
+            mlno.kernel()   # reuses the LNOs instead of rebuilding them
+
+        Args:
+            ifrag (int or iterable of int, optional):
+                Fragment(s) to build, indexing `frag_lolist`. Default: all fragments.
+            eris (optional):
+                Full-system integrals. Built via `ao2mo` (and reused across fragments) if
+                not given. A caller-supplied eris is left intact; one built here is
+                released afterwards unless it is needed again (see `_keep_lno_eris`).
+
+        Returns:
+            One {'lno_occ', 'lno_vir'} dict if `ifrag` is an int, else a list of them, one
+            per requested fragment.
+        '''
+        self._precompute()
+
+        single = isinstance(ifrag, numbers.Integral)
+        if ifrag is None:
+            ifraglist = list(range(self.nfrag))
+        elif single:
+            ifraglist = [ifrag]
+        else:
+            ifraglist = list(ifrag)
+
+        lno_pct_occ = [None, None] if self.lno_pct_occ is None else self.lno_pct_occ
+        lno_norb = [[None, None]] * self.nfrag if self.lno_norb is None else self.lno_norb
+
+        eris_built_here = eris is None
+        if eris is None:
+            eris = self.ao2mo()
+
+        frag_lno = []
+        for i in ifraglist:
+            orbloc, lno_param = _frag_orbloc(self.lo_coeff, self.frag_lolist[i], i,
+                                             self.lno_thresh, lno_pct_occ, lno_norb)
+            lnofrag, frozen = self.make_las(eris, orbloc, self.lno_type, lno_param)[:2]
+            frag_lno.append(self._pack_las(lnofrag, frozen))
+
+        if eris_built_here and not self._keep_lno_eris:
+            _release_eris(eris)
+
+        return frag_lno[0] if single else frag_lno
+
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
         if self._lno_uses_rpa:
             return make_lo_rdm1_occ(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
@@ -900,6 +970,32 @@ class LNO(lib.StreamObject):
         return tuple(list(x) for x in zip(*[
             join_las(las['lno_occ'][s], las['lno_vir'][s], mo_coeff[s], mo_occ[s], s1e,
                      orbloc[s]) for s in range(2)]))
+
+    def _restart_frags(self, lo_coeff, frag_lolist):
+        r''' Turn the restart inputs `frag_lno` / `frag_eners` into the three per-fragment
+        lists `kernel` works with, and seed the chkfile:
+
+            frag_lno   : active LNOs, or None if they must be built
+            frag_eners : stored energy dicts (see `_frag_res_to_dict`)
+            frag_res   : decoded `impurity_solve` results, None where a fragment is unsolved
+                         (or its stored energies were incomplete and must be recomputed)
+        '''
+        nfrag = len(frag_lolist)
+        frag_lno = [None]*nfrag if self.frag_lno is None else list(self.frag_lno)
+        frag_eners = [None]*nfrag if self.frag_eners is None else list(self.frag_eners)
+        if len(frag_lno) != nfrag or len(frag_eners) != nfrag:
+            logger.error(self, 'frag_lno and frag_eners must have one entry per fragment '
+                         '(%d).', nfrag)
+            raise ValueError
+        frag_res = [None]*nfrag
+        for ifrag, dic in enumerate(frag_eners):
+            if dic is not None:
+                frag_res[ifrag] = self._frag_res_from_dict(dic)
+                if frag_res[ifrag] is None:
+                    logger.info(self, 'Fragment %d/%d  energies incomplete; the fragment '
+                                'is recomputed', ifrag+1, nfrag)
+        self._chk_init(lo_coeff, frag_lolist, frag_lno, frag_eners)
+        return frag_lno, frag_eners, frag_res
 
     def _chk_init(self, lo_coeff, frag_lolist, frag_lno, frag_eners):
         r''' Start the chkfile of a `kernel` run with the restart data it is given. '''
