@@ -99,6 +99,10 @@ class KLNO(LNO):
             nvir = orbvir.shape[1]
             # FIXME: more accurate mem estimate
             mem_now = self.max_memory - lib.current_memory()[0]
+            # K2SDF reads with_df._cderi directly, so build the DF integrals first if needed
+            # (e.g. when the KSCF was restored from a chkfile and never ran a JK build)
+            if self.with_df._cderi is None:
+                self.with_df.build()
             # count q points and aux size exactly as the ERI classes do (on even meshes the
             # zone-boundary q = -q points make the IBZ larger than nkpts//2+nkpts%2)
             k2sdf = K2SDF(self.with_df)
