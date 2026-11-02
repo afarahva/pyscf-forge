@@ -233,10 +233,9 @@ class _KLNODFOUTCOREERIS_REAL(_KLNODFINCOREERIS_REAL):
             else:
                 self.feri = lib.H5TmpFile()
             log.info('ovL is saved to %s', self.feri.filename)
-            # one chunk per (i, q) so that each q block written by _init_mp_df_eris_real
-            # fills whole chunks; an unchunked dataset turns every ovL[:,:,q-block] write
-            # into a read-modify-write of each (i,a) row
-            chunks = (1,self.nvir,self.naux)
+            # one chunk per occupied orbital, as in lno.py; _init_mp_df_eris_real writes
+            # whole ovL[i0:i1] rows so each chunk is written once and read contiguously
+            chunks = (1,self.nvir,self.Naux_ibz)
             self.ovLR = self.feri.create_dataset('ovLR', ovL_shape, ovL_dtype, chunks=chunks)
             self.ovLI = self.feri.create_dataset('ovLI', ovL_shape, ovL_dtype, chunks=chunks)
             _init_mp_df_eris_real(self, self.orbocc, self.orbvir, self.max_memory,
@@ -284,9 +283,9 @@ def _init_mp_df_eris_real(k2sdf, orbocc, orbvir, max_memory, ovLR=None, ovLI=Non
 
     if isinstance(ovLR, np.ndarray):
         mem_avail -= Naux*nocc*nvir*2 * dsize/1e6   # subtract mem for holding ovLR/I incore
-        mode = 'incore'
     else:
-        mode = 'outcore'
+        return _init_mp_df_eris_real_outcore(k2sdf, orbocc, orbvir, mem_avail, ovLR, ovLI, log)
+    mode = 'incore'
 
     # batching aux (OV*3 + Nao_pair) * [X] = M
     mem_auxblk = (nao**2+nocc*nvir*3) * dsize/1e6
@@ -326,6 +325,75 @@ def _init_mp_df_eris_real(k2sdf, orbocc, orbvir, max_memory, ovLR=None, ovLI=Non
         cput1 = log.timer('ao2mo for qidx %d/%d'%(qi+1,nqpts), *cput1)
 
     buf = bufR = bufI = None
+
+    return ovLR, ovLI
+
+def _init_mp_df_eris_real_outcore(k2sdf, orbocc, orbvir, mem_avail, ovLR, ovLI, log):
+    r''' Outcore _init_mp_df_eris_real, organized as lno._init_mp_df_eris: for each block of
+    occupied orbitals, all q are transformed into whole ovL[i0:i1] rows in memory, which are
+    then written once. The AO DF integrals are re-read once per occupied block.
+    '''
+    nao = k2sdf.cell.nao_nr()
+    naux_by_q = k2sdf.naux_by_q
+    naux = k2sdf.naux
+    Naux = k2sdf.Naux_ibz
+    nocc = orbocc.shape[1]
+    nvir = orbvir.shape[1]
+
+    REAL = np.float64
+    COMPLEX = np.complex128
+    dsize = 8
+
+    cput1 = (logger.process_clock(), logger.perf_counter())
+
+    # batching occ [O]VX*2 and aux ([O]V*3 + Nao_pair) * [X]
+    mem_occblk = nvir*Naux*2 * dsize/1e6
+    occ_blksize = min(nocc, max(1, int(np.floor(mem_avail*0.6 / mem_occblk))))
+    if DEBUG_BLKSIZE: occ_blksize = max(1,nocc//2)
+    mem_auxblk = (nao**2+occ_blksize*nvir*3) * dsize/1e6
+    aux_blksize = min(naux, max(1, int(np.floor(mem_avail*0.3 / mem_auxblk))))
+    if DEBUG_BLKSIZE: aux_blksize = max(1,naux//2)
+    log.debug('occ blksize for outcore ao2mo: %d/%d', occ_blksize, nocc)
+    log.debug('aux blksize for outcore ao2mo: %d/%d', aux_blksize, naux)
+    bufOR = np.empty(occ_blksize*nvir*Naux, dtype=REAL)
+    bufOI = np.empty(occ_blksize*nvir*Naux, dtype=REAL)
+    buf = np.empty(aux_blksize*occ_blksize*nvir, dtype=COMPLEX)
+    bufR = np.empty(aux_blksize*occ_blksize*nvir, dtype=REAL)
+    bufI = np.empty(aux_blksize*occ_blksize*nvir, dtype=REAL)
+
+    for i0,i1 in lib.prange(0,nocc,occ_blksize):
+        nocci = i1 - i0
+        orbocci = np.asarray(orbocc[:,i0:i1], order='C')
+        OvLR = np.ndarray((nocci,nvir,Naux), dtype=REAL, buffer=bufOR)
+        OvLI = np.ndarray((nocci,nvir,Naux), dtype=REAL, buffer=bufOI)
+        OvLR.fill(0)    # also the zero pad [nauxq,naux) of each q block
+        OvLI.fill(0)
+        for qi,q in enumerate(k2sdf.ibz2bz):
+            nauxq = naux_by_q[q]
+            w = k2sdf.qpts_ibz_weights[qi]
+            for p0,p1 in lib.prange(0, nauxq, aux_blksize):
+                dp = p1 - p0
+                LovR = np.ndarray((dp,nocci,nvir), dtype=REAL, buffer=bufR)
+                LovI = np.ndarray((dp,nocci,nvir), dtype=REAL, buffer=bufI)
+                LovR.fill(0)
+                LovI.fill(0)
+                for (ki,kj),LpqR,LpqI in k2sdf.loop_ao2mo(q, orbocci, orbvir, buf=buf,
+                                                          real_and_imag=True, auxslice=(p0,p1)):
+                    LovR += LpqR.reshape(dp,nocci,nvir)
+                    LovI += LpqI.reshape(dp,nocci,nvir)
+                    LpqR = LpqI = None
+                LovR *= w
+                LovI *= w
+                b0 = naux*qi + p0
+                OvLR[:,:,b0:b0+dp] = LovR.transpose(1,2,0)
+                OvLI[:,:,b0:b0+dp] = LovI.transpose(1,2,0)
+                LovR = LovI = None
+        ovLR[i0:i1] = OvLR
+        ovLI[i0:i1] = OvLI
+        OvLR = OvLI = None
+        cput1 = log.timer('ao2mo for occ %d:%d/%d'%(i0,i1,nocc), *cput1)
+
+    bufOR = bufOI = buf = bufR = bufI = None
 
     return ovLR, ovLI
 
