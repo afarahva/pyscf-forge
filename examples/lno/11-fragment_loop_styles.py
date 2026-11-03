@@ -1,19 +1,22 @@
 #!/usr/bin/env python
 
 r'''
-Two equivalent ways to run an LNO calculation over many fragments, and their very
-different memory profiles.
+Two equivalent ways to run an LNO calculation over many fragments, and their memory
+profiles.
 
 Style A -- one combined `kernel()` call (the default).
-    All fragment LNOs are built first, then all impurity problems are solved. The
-    full-system integrals are transformed only once, but every fragment's LNOs are
-    held in memory at the same time.  Peak memory ~ (integrals) + (all LNOs).
+    Fragments are done one at a time: each fragment's LNOs are built from the
+    full-system integrals and its impurity problem is solved before the next fragment.
+    The full-system integrals are transformed once and kept for all fragments.
+    Peak memory ~ (full-system integrals) + (one impurity problem).
 
-Style B -- one fragment at a time, sharing a single in-core integral transform.
-    The full-system integrals are built once and passed to each single-fragment
-    `kernel(eris=eris)` call, so they are not rebuilt; only one fragment's LNOs live
-    at a time.  Peak memory ~ (integrals) + (one fragment's LNOs).  This reproduces
-    the memory profile of the pre-two-phase code.
+Style B -- one job per fragment, with `delete_full_eris = True`.
+    Each job only treats its own fragment (here: a single-fragment `frag_lolist`; with
+    a shared chkfile, `frag_eners` / `load_chk` can be used instead). The full-system
+    integrals are only needed for the LNOs, so `delete_full_eris` releases them before
+    the impurity problem, leaving all of `max_memory` to the impurity solver.
+    Peak memory ~ max(full-system integrals, one impurity problem). The jobs are
+    independent and can run in parallel, e.g. as separate cluster jobs.
 
 Because the per-fragment energies are strictly additive (the total correlation energy
 is just their sum, with unit `frag_wghtlist`), the two styles give identical energies.
@@ -51,23 +54,20 @@ e_ccsd_A = mcc_A.e_corr_ccsd
 e_pt2_A = mcc_A.e_corr_pt2
 
 #
-# Style B: one fragment at a time, sharing a single in-core integral transform.
+# Style B: one independent job per fragment, releasing the full-system integrals before
+# the impurity problem.
 #
 nfrag = len(frag_lolist)
 efrag_cc = np.zeros(nfrag)
 efrag_pt2 = np.zeros(nfrag)
 
-eris = None
 for i, loidx in enumerate(frag_lolist):
-    mcc_i = LNOCCSD(mf, lo_coeff, [loidx], lno_thresh=lno_thresh).set(verbose=4)
-    if eris is None:
-        # Built once.  ao2mo() chooses in-core automatically when the integrals fit in
-        # `max_memory`; with enough memory the same in-core object serves every fragment.
-        eris = mcc_i.ao2mo()
-    mcc_i.kernel(eris=eris)          # reused, not rebuilt or destroyed
+    mcc_i = LNOCCSD(mf, lo_coeff, [loidx], lno_thresh=lno_thresh)
+    mcc_i.delete_full_eris = True
+    mcc_i.kernel()
     efrag_cc[i] = mcc_i.e_corr_ccsd  # single-fragment total == this fragment's energy
     efrag_pt2[i] = mcc_i.e_corr_pt2
-    del mcc_i                        # frees only this fragment's LNOs
+    del mcc_i
 
 e_ccsd_B = efrag_cc.sum()
 e_pt2_B = efrag_pt2.sum()

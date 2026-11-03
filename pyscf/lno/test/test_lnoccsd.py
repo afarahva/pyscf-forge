@@ -252,8 +252,8 @@ class WaterDimer(unittest.TestCase):
 
 def kernel_counted(mcc):
     ''' mcc.kernel() with the calls of ao2mo, make_las and impurity_solve counted. Checks
-        that the integrals for the LNOs are released before the impurity problems unless
-        they are kept for them (mcc._keep_lno_eris).
+        that with `delete_full_eris` the integrals for the LNOs are released before the
+        impurity problems unless they need them (mcc._imp_uses_full_eris).
     '''
     import weakref
     calls = dict.fromkeys(['ao2mo', 'make_las', 'impurity_solve'], 0)
@@ -262,7 +262,8 @@ def kernel_counted(mcc):
         fn = getattr(mcc, name)
         def wrapped(*args, **kwargs):
             calls[name] += 1
-            if name == 'impurity_solve' and not mcc._keep_lno_eris:
+            if (name == 'impurity_solve' and mcc.delete_full_eris and
+                    not mcc._imp_uses_full_eris):
                 assert all(ref() is None for ref in eris_refs), 'LNO integrals not released'
             out = fn(*args, **kwargs)
             if name == 'ao2mo':

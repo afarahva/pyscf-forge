@@ -3,12 +3,14 @@
 r'''
 Checkpoint / restart for LNO calculations.
 
-`kernel()` writes a chkfile as it goes:
+`kernel()` treats the fragments one at a time and writes a chkfile as it goes:
   * after a fragment's LNO active space is built  -> 'lno/frag<i>/las'
+    (unless `save_lno = False`, e.g. when the LNO active spaces are very large)
   * after its impurity problem is solved          -> 'lno/frag<i>/energy'
 plus any full-system low-level energies (RPA / BW-s2).  A later run reads this file with
 `load_chk()`, which populates `frag_lno` (LNOs that are built) and `frag_eners` (fragments
-that are finished).  The next `kernel()` then only computes what is missing:
+that are finished); both can also be set by hand.  The next `kernel()` then only computes
+what is missing:
 
   * a fragment with a stored energy is skipped entirely;
   * a fragment with stored LNOs but no energy skips the (expensive) LNO build and only

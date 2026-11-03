@@ -60,14 +60,16 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
            lno_norb=None, eris=None):
     r''' Kernel function for LNO-based methods.
 
-    The LNO active spaces of all fragments are built first, then all impurity problems
-    are solved. The full-system integrals used for the LNOs (`eris`) are released in
-    between unless the impurity problems need them (see `LNO._keep_lno_eris`).
+    Fragments are treated one at a time: the LNO active space of a fragment is built from
+    the full-system integrals (`eris`) and its impurity problem is solved before moving on
+    to the next fragment. With `mlno.delete_full_eris`, the full-system integrals are
+    released before each impurity problem, leaving the memory to the impurity solver, and
+    rebuilt for the next fragment that needs LNOs.
 
-    Fragments whose LNOs (`mlno.frag_lno`) or energies (`mlno.frag_eners`) are already
-    known, e.g. from `mlno.load_chk`, are not recomputed: a fragment with energies is
-    skipped, and a fragment with LNOs only has its impurity problem solved. Both are
-    saved to `mlno.chkfile` as each fragment finishes.
+    Fragments whose energies (`mlno.frag_eners`) are already known, e.g. from
+    `mlno.load_chk`, are skipped, and fragments whose LNOs (`mlno.frag_lno`) are known
+    reuse them instead of building them. As each fragment finishes, its energies and (with
+    `mlno.save_lno`) its LNOs are saved to `mlno.chkfile`.
 
     Args:
         lo_coeff (np.ndarray):
@@ -83,6 +85,10 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
                 fragment 3 consists of LO 4,
                 fragment 4 consists of LO 6, 7, 8, and 9,
                 ...
+        eris (optional):
+            Full-system integrals from `mlno.ao2mo`. Built here if not given. Integrals
+            passed in are used for every fragment and left intact for the caller
+            (`delete_full_eris` only applies to integrals built here).
     '''
     nfrag = len(frag_lolist)
     if lno_pct_occ is None:
@@ -96,66 +102,63 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
     cput0 = (logger.process_clock(), logger.perf_counter())
 
-    # Whether the full-system integrals are built inside this call. Only such eris are torn
-    # down below; an eris passed in by the caller is left intact so it can be reused across
-    # calls (e.g. one ao2mo build shared by per-fragment `kernel(eris=eris)` runs).
-    eris_created_here = eris is None
-
     # Restart: unpack `mlno.frag_lno` / `mlno.frag_eners` and seed the chkfile.
     frag_lno, frag_eners, frag_res = mlno._restart_frags(lo_coeff, frag_lolist)
+    nlas = sum(frag_res[i] is None and frag_lno[i] is None for i in range(nfrag))
 
-    # Fragments that still need their LNOs built, and whether the full-system low-level
-    # amplitudes (RPA / BW-s2) still need solving. The integrals are transformed once, here,
-    # if anything below needs them; the per-fragment LNOs would otherwise solve for them.
-    frag_todo_las = [ifrag for ifrag in range(nfrag)
-                     if frag_res[ifrag] is None and frag_lno[ifrag] is None]
-    need_rpa = ((mlno._lno_uses_rpa or mlno._pt2_uses_rpa) and
-                (mlno.e_corr_rpa_full is None or
-                 (mlno._pt2_amp == 'sosex' and mlno.e_corr_sosex_full is None)))
-    need_bws2 = ('bws2' in (mlno._lno_amp, mlno._pt2_amp) and mlno.e_corr_bws2_full is None)
-    if frag_todo_las or need_rpa or need_bws2:
-        if eris is None: eris = mlno.ao2mo()
-        if need_rpa: mlno.solve_rpa(eris)
-        if need_bws2: mlno.solve_bws2(eris)
-        mlno._chk_dump_full()
+    # Only integrals built here are torn down: by `delete_full_eris` before each impurity
+    # problem, and at the end otherwise.
+    eris_created_here = eris is None
+    delete_eris = mlno.delete_full_eris and eris_created_here
+    if mlno.delete_full_eris and not eris_created_here:
+        log.info('delete_full_eris: the integrals passed to kernel are kept')
+    if delete_eris and mlno._imp_uses_full_eris:
+        log.warn('delete_full_eris is ignored: the %s fragment energies need the '
+                 'full-system integrals', mlno._pt2_label)
+        delete_eris = False
+    if delete_eris and nlas > 1:
+        log.info('delete_full_eris: the full-system integrals are rebuilt for each of the '
+                 '%d fragments that need LNOs', nlas)
+
+    # Transform the integrals now if any fragment needs LNOs or the full-system low-level
+    # amplitudes (RPA / BW-s2) still need solving.
+    if nlas > 0 or mlno._need_full_solve:
+        eris = mlno._full_eris(eris)
 
     cput2 = cput1 = (logger.process_clock(), logger.perf_counter())
 
-    # Phase 1: build the LNO active space of every fragment that needs one.
-    for ifrag in frag_todo_las:
-        orbloc, lno_param = _frag_orbloc(lo_coeff, frag_lolist[ifrag], ifrag, lno_thresh,
-                                         lno_pct_occ, lno_norb)
-
-        lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(eris, orbloc, lno_type, lno_param)
-        frag_lno[ifrag] = mlno._pack_las(lnofrag, frozen)
-        mlno._chk_dump_frag(ifrag, 'las', dict(orbloc=orbloc, **frag_lno[ifrag]))
-        cput2 = log.timer('Fragment %d make las'%(ifrag+1), *cput2)
-        log.info('Fragment %d/%d  LAS: %s', ifrag+1, nfrag, frag_msg)
-    lnofrag = frozen = uocc_loc = None
-
-    # The LNOs are built; the integrals that built them (and BW-s2's dressed ones) are no
-    # longer needed unless the impurity problems reuse them (`_keep_lno_eris`). Free them
-    # now, before those problems write their own integrals to disk. Only an eris built here
-    # is torn down in place (its scratch file closed); a caller's eris is left for reuse.
-    mlno._bws2 = None
-    if not mlno._keep_lno_eris:
-        if eris is not None:
-            log.info('Releasing the full-system integrals used for the LNOs')
-            if eris_created_here:
-                _release_eris(eris)
-        eris = None
-
-    # Phase 2: solve each fragment's impurity problem (skipping ones restored from chkfile).
     for ifrag,loidx in enumerate(frag_lolist):
         if frag_res[ifrag] is not None:
             log.info('Fragment %d/%d  Sol: restored', ifrag+1, nfrag)
             continue
 
-        orbloc = _frag_orbloc(lo_coeff, loidx, ifrag)[0]
-        lnofrag, frozen, uocc_loc = mlno._unpack_las(frag_lno[ifrag], orbloc)
+        # LNO active space: build it or reuse the one given
+        if frag_lno[ifrag] is None:
+            if eris is None: eris = mlno._full_eris()   # released by delete_full_eris
+            orbloc, lno_param = _frag_orbloc(lo_coeff, loidx, ifrag, lno_thresh,
+                                             lno_pct_occ, lno_norb)
+            lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(eris, orbloc, lno_type,
+                                                                lno_param)
+            if mlno.save_lno:
+                mlno._chk_dump_frag(ifrag, 'las',
+                                    dict(orbloc=orbloc, **mlno._pack_las(lnofrag, frozen)))
+            cput2 = log.timer('Fragment %d make las'%(ifrag+1), *cput2)
+            log.info('Fragment %d/%d  LAS: %s', ifrag+1, nfrag, frag_msg)
+        else:
+            orbloc = _frag_orbloc(lo_coeff, loidx, ifrag)[0]
+            lnofrag, frozen, uocc_loc = mlno._unpack_las(frag_lno[ifrag], orbloc)
+            frag_lno[ifrag] = None
+            log.info('Fragment %d/%d  LAS: restored', ifrag+1, nfrag)
+
+        if delete_eris and eris is not None:
+            log.info('Releasing the full-system integrals')
+            mlno._release_full_eris(eris)
+            eris = None
 
         # the RPA/SOSEX fragment energies project the full-system integrals
-        if eris is None and mlno._pt2_uses_rpa: eris = mlno.ao2mo()
+        if eris is None and mlno._imp_uses_full_eris:
+            eris = mlno.ao2mo()
+            eris_created_here = True
 
         # calculate domains/prune basis
         if mlno.prune_lno_basis:
@@ -181,6 +184,7 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
         # solve impurity problem
         frag_res[ifrag], frag_msg = mlno.impurity_solve(mf_frag, lnofrag, uocc_loc, eris, frozen=frozen)
+        lnofrag = frozen = uocc_loc = None
         frag_eners[ifrag] = mlno._frag_res_to_dict(frag_res[ifrag])
         mlno._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
         cput2 = log.timer('Fragment %d imp sol '%(ifrag+1), *cput2)
@@ -196,6 +200,12 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
             mlno._h1e = None
             mlno._vhf = None
             mlno._precompute()
+
+    # BW-s2's dressed integrals are only needed while LNOs are built
+    mlno._bws2 = None
+    if eris is not None and eris_created_here:
+        mlno._release_full_eris(eris)
+    eris = None
 
     classname = mlno.__class__.__name__
     cput0 = log.timer(classname+' '*(17-len(classname)), *cput0)
@@ -284,9 +294,8 @@ def _same_orbloc(orbloc1, orbloc2):
 def _release_eris(eris):
     r''' Free the full-system integrals used to build the LNOs. Any HDF5 file backing an
     outcore eris is closed (and, when it is a scratch file, deleted) so that both its memory
-    and its disk space are reclaimed before the impurity problems run, rather than waiting
-    on garbage collection. Only called when the eris are a temporary not needed again (see
-    `LNO._keep_lno_eris`).
+    and its disk space are reclaimed right away rather than on garbage collection. Only
+    called on integrals built by `kernel` / `make_lno_active_space` themselves.
     '''
     feri = getattr(eris, 'feri', None)
     if feri is not None:
@@ -295,7 +304,9 @@ def _release_eris(eris):
         except Exception:
             pass
         eris.feri = None
-    eris.ovL = None
+    for key in ('ovL', 'ovLR', 'ovLI'):
+        if hasattr(eris, key):
+            setattr(eris, key, None)
 
 
 def make_las(mlno, eris, orbloc, lno_type, lno_param):
@@ -537,11 +548,21 @@ class LNO(lib.StreamObject):
         self._ovL_to_save = None
         self.force_outcore_ao2mo = False
 
+        # memory
+        #   delete_full_eris : release the full-system integrals (only needed to build the
+        #                      LNOs) before each impurity problem, leaving the memory to the
+        #                      impurity solver. They are rebuilt for the next fragment that
+        #                      needs LNOs, so this suits runs with one or few fragments per
+        #                      job. Ignored if the fragment energies need the integrals
+        #                      (pt2_amp 'rpa' / 'sosex').
+        self.delete_full_eris = False
+
         # checkpoint and restart
-        #   chkfile    : the LOs and LNOs of each fragment are saved as they are built,
-        #                and its energies as its impurity problem is solved. As for SCF,
-        #                the default file is removed with the object; assign a filename
-        #                to keep it.
+        #   chkfile    : the energies of each fragment are saved as its impurity problem
+        #                is solved, and (if save_lno) its LOs and LNOs as they are built.
+        #                As for SCF, the default file is removed with the object; assign
+        #                a filename to keep it.
+        #   save_lno   : whether to save the LNOs to the chkfile (they can be large)
         #   frag_lno   : restart input, per fragment None or its active LNOs
         #                {'lno_occ', 'lno_vir'} (lists over spin for ULNO); given LNOs
         #                are not rebuilt
@@ -553,6 +574,7 @@ class LNO(lib.StreamObject):
         else:
             self._chkfile = lib.NamedTemporaryFile(dir=lib.param.TMPDIR)
             self.chkfile = self._chkfile.name
+        self.save_lno = True
         self.frag_lno = None
         self.frag_eners = None
         self._chk_loaded = None
@@ -635,7 +657,8 @@ class LNO(lib.StreamObject):
         log.info('_ovL = %s', self._ovL)
         log.info('_ovL_to_save = %s', self._ovL_to_save)
         log.info('force_outcore_ao2mo = %s', self.force_outcore_ao2mo)
-        log.info('chkfile = %s', self.chkfile)
+        log.info('chkfile = %s  save_lno = %s', self.chkfile, self.save_lno)
+        log.info('delete_full_eris = %s', self.delete_full_eris)
         if self.frag_lno is not None or self.frag_eners is not None:
             log.info('restart: LNOs of %d and energies of %d fragments given',
                      sum(x is not None for x in (self.frag_lno or [])),
@@ -751,7 +774,7 @@ class LNO(lib.StreamObject):
             eris (optional):
                 Full-system integrals. Built via `ao2mo` (and reused across fragments) if
                 not given. A caller-supplied eris is left intact; one built here is
-                released afterwards unless it is needed again (see `_keep_lno_eris`).
+                released afterwards.
 
         Returns:
             One {'lno_occ', 'lno_vir'} dict if `ifrag` is an int, else a list of them, one
@@ -771,8 +794,7 @@ class LNO(lib.StreamObject):
         lno_norb = [[None, None]] * self.nfrag if self.lno_norb is None else self.lno_norb
 
         eris_built_here = eris is None
-        if eris is None:
-            eris = self.ao2mo()
+        eris = self._full_eris(eris)
 
         frag_lno = []
         for i in ifraglist:
@@ -781,8 +803,9 @@ class LNO(lib.StreamObject):
             lnofrag, frozen = self.make_las(eris, orbloc, self.lno_type, lno_param)[:2]
             frag_lno.append(self._pack_las(lnofrag, frozen))
 
-        if eris_built_here and not self._keep_lno_eris:
-            _release_eris(eris)
+        self._bws2 = None
+        if eris_built_here:
+            self._release_full_eris(eris)
 
         return frag_lno[0] if single else frag_lno
 
@@ -938,13 +961,48 @@ class LNO(lib.StreamObject):
         return self.get_nmo()
 
     @property
-    def _keep_lno_eris(self):
-        r''' Whether the full-system integrals used for the LNOs are kept for the impurity
-        problems: when they are read from or saved to a file (`_ovL`, `_ovL_to_save`), with
-        domains (`prune_lno_basis`), or with the RPA/SOSEX amplitudes.
+    def _imp_uses_full_eris(self):
+        r''' Whether the impurity problems need the full-system integrals: the RPA/SOSEX
+        fragment energies project them onto the active space.
         '''
-        return (self._ovL is not None or self._ovL_to_save is not None or
-                self.prune_lno_basis or self._lno_uses_rpa or self._pt2_uses_rpa)
+        return self._pt2_uses_rpa
+
+    @property
+    def _need_rpa(self):
+        r''' Whether the full-system drCCD energies are still unknown. '''
+        return ((self._lno_uses_rpa or self._pt2_uses_rpa) and
+                (self.e_corr_rpa_full is None or
+                 (self._pt2_amp == 'sosex' and self.e_corr_sosex_full is None)))
+
+    @property
+    def _need_bws2(self):
+        r''' Whether the full-system BW-s2 energy is still unknown. '''
+        return 'bws2' in (self._lno_amp, self._pt2_amp) and self.e_corr_bws2_full is None
+
+    @property
+    def _need_full_solve(self):
+        return self._need_rpa or self._need_bws2
+
+    def _full_eris(self, eris=None):
+        r''' The full-system integrals for the LNOs, built via `ao2mo` if not given, with
+        the full-system RPA / BW-s2 problems solved if their energies are still unknown.
+        '''
+        if eris is None: eris = self.ao2mo()
+        need_rpa, need_bws2 = self._need_rpa, self._need_bws2
+        if need_rpa: self.solve_rpa(eris)
+        if need_bws2: self.solve_bws2(eris)
+        if need_rpa or need_bws2: self._chk_dump_full()
+        return eris
+
+    def _release_full_eris(self, eris):
+        r''' Release full-system integrals built here, with the low-level amplitudes
+        cached on them.
+        '''
+        if self._bws2 is not None and self._bws2[0] is eris:
+            self._bws2 = None
+        if self._rpa_amp is not None and self._rpa_amp[0] is eris:
+            self._rpa_amp = None
+        _release_eris(eris)
 
     def _pack_las(self, lnofrag, frozen):
         r''' Active LNOs {'lno_occ', 'lno_vir'} of an LAS returned by `make_las`. '''
@@ -1010,7 +1068,7 @@ class LNO(lib.StreamObject):
                         del f['lno']
             self._chk_dump_full()
             for ifrag,loidx in enumerate(frag_lolist):
-                if frag_lno[ifrag] is not None:
+                if self.save_lno and frag_lno[ifrag] is not None:
                     orbloc = _frag_orbloc(lo_coeff, loidx, ifrag)[0]
                     self._chk_dump_frag(ifrag, 'las',
                                         dict(orbloc=orbloc, lno_occ=frag_lno[ifrag]['lno_occ'],
