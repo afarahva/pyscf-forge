@@ -62,18 +62,20 @@ einsum = lib.einsum
 WITH_T2 = getattr(__config__, 'pbc_regpt2_kdriccd_with_t2', True)
 
 
-def kernel(mycc, J, D, verbose=None):
+def kernel(mycc, J, D, minus=None, verbose=None):
     r''' Dressed integrals U_q of drCCD with the solver set in `mycc`.
 
     Args:
         J, D : per momentum transfer q, the DF integrals J_q (nexc, naux) and the
                excitation energies D_q = e_a - e_i (nexc), see `get_ovJ`.
+        minus : the label of -q for each q. Default is from `mycc.khelper`.
 
     Returns:
         converged, U (list over q)
     '''
     log = logger.new_logger(mycc, verbose)
-    minus = mycc.khelper.kconserv[0,:,0]      # q -> -q
+    if minus is None:
+        minus = mycc.khelper.kconserv[0,:,0]      # q -> -q
     solver = mycc.solver.lower()
     if solver == 'riccati':
         return kernel_riccati(J, D, minus, cd_thresh=mycc.cd_thresh,
@@ -206,16 +208,16 @@ def energy(U, J, nkpts):
     e = sum(np.sum((Uq - Jq.conj()) * Jq) for Uq, Jq in zip(U, J)).real / nkpts
     return lib.tag_array(e, e_corr_ss=e*.5, e_corr_os=e*.5)
 
-def energy_sosex_and_t2(mycc, U, J, mo_energy, with_t2=WITH_T2):
-    r''' E_SOSEX per cell and the amplitudes t2[ki,kj,ka] (if with_t2). '''
-    nocc, nkpts = mycc.nocc, mycc.nkpts
-    nvir = mycc.nmo - nocc
+def energy_sosex_and_t2(U, J, eo, ev, kconserv, with_t2=WITH_T2):
+    r''' E_SOSEX per cell and the amplitudes t2[ki,kj,ka] (if with_t2), for the occupied
+    and virtual orbital energies eo[k], ev[k] and `kconserv` of
+    `pyscf.pbc.lib.kpts_helper.get_kconserv`.
+    '''
+    nkpts = len(eo)
+    nocc, nvir = len(eo[0]), len(ev[0])
     nov = nocc * nvir
-    kconserv = mycc.khelper.kconserv
     def blk(X, ki, ka):     # (nocc, nvir, naux) block of the excitations (ki,ka)
         return X[kconserv[ka,ki,0]][ki*nov:(ki+1)*nov].reshape(nocc,nvir,-1)
-    eo = [e[:nocc] for e in mo_energy]
-    ev = [e[nocc:] for e in mo_energy]
     t2 = np.zeros((nkpts,nkpts,nkpts,nocc,nocc,nvir,nvir), dtype=complex) if with_t2 else None
     ex = 0.
     for ki in range(nkpts):
@@ -293,7 +295,10 @@ class KDRICCD(kmp2.KMP2):
         e_corr = energy(self.U, J, self.nkpts)
         t2 = None
         if self.with_sosex or with_t2:
-            e_sosex, t2 = energy_sosex_and_t2(self, self.U, J, mo_energy, with_t2)
+            nocc = self.nocc
+            e_sosex, t2 = energy_sosex_and_t2(self.U, J, [e[:nocc] for e in mo_energy],
+                                              [e[nocc:] for e in mo_energy],
+                                              self.khelper.kconserv, with_t2)
             if self.with_sosex:
                 self.e_corr_sosex = e_sosex
         return e_corr, t2

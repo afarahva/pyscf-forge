@@ -310,7 +310,7 @@ class ShiftedKmesh(unittest.TestCase):
         self.assertNotAlmostEqual(kmcc.e_corr_pt2, ref[0], 4)
 
         # complex orbitals (k-mesh not closed under k -> -k; LNOs only, as the impurity
-        # CCSD needs real orbitals): no drCCD amplitudes
+        # CCSD needs real orbitals): drCCD amplitudes only with k-point symmetry (k_eris)
         kmf = self._kmf([2,1,1], [0.1,0,0])
         smf = k2s_scf(kmf)
         def make_las(**kwargs):
@@ -323,8 +323,10 @@ class ShiftedKmesh(unittest.TestCase):
         for x0, x1 in zip(las0, las1):
             for key in ('lno_occ', 'lno_vir'):
                 self.assertAlmostEqual(abs(proj(x1[key]) - proj(x0[key])).max(), 0, 8)
+        las2 = make_las(lno_amp='rpa')
+        self.assertTrue(np.iscomplexobj(las2[0]['lno_occ']))
         with self.assertRaises(NotImplementedError):
-            make_las(lno_amp='rpa')
+            make_las(lno_amp='rpa', k_eris=False)
 
 
 

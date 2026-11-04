@@ -31,6 +31,7 @@
 
 
 import sys
+import copy
 import numpy as np
 import h5py
 
@@ -40,6 +41,7 @@ from pyscf.pbc.df.df import _load3c
 from pyscf import __config__
 
 from pyscf.lno import LNO, drpa
+from pyscf.pbc.regpt2 import kdriccd
 from pyscf.pbc.lib.kpts_helper import get_kconserv
 from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh, s2k_mo_coeff
 from pyscf.pbc.lno.make_lno_rdm1 import (make_lo_rdm1_occ, make_lo_rdm1_vir,
@@ -78,9 +80,11 @@ class KLNO(LNO):
         k_eris (bool):
             Build the LNO density matrices from the k-point DF integrals of the Bloch
             orbitals (`make_lno_rdm1.make_lo_rdm1_1h_k`) instead of the supercell-layout
-            integrals: ~Nk/2 times less memory. Used for '1h'/'1h' MP2 and kappa-MP2 LNOs
-            with in-core integrals and active orbitals made of whole bands (the same number
-            per k-point); otherwise the supercell integrals are used. Default is True.
+            integrals: ~Nk/2 times less memory. For RPA/SOSEX LNOs the full-system drCCD
+            is then solved with k-point symmetry (`pyscf.pbc.regpt2.kdriccd`). Used for
+            '1h'/'1h' LNOs with in-core integrals and active orbitals made of whole bands
+            (the same number per k-point); otherwise the supercell integrals are used.
+            Default is True.
     '''
 
     def __init__(self, kmf, lo_coeff, frag_lolist, lno_type=None, lno_thresh=None, frozen=None,
@@ -147,9 +151,7 @@ class KLNO(LNO):
         (see `k_eris`), or None where they do not apply.
         '''
         log = logger.new_logger(self)
-        if self._lno_uses_rpa:
-            reason = 'lno_amp = %s' % self._lno_amp
-        elif list(self.lno_type) != ['1h','1h']:
+        if list(self.lno_type) != ['1h','1h']:
             reason = 'lno_type = %s' % self.lno_type
         elif (self._ovL is not None or self._ovL_to_save is not None or
               self.force_outcore_ao2mo or self.with_df is None):
@@ -186,6 +188,37 @@ class KLNO(LNO):
         fragment energies of one unit cell's fragments (and KMP2).
         '''
         return 1. / len(self.kpts)
+
+    def solve_rpa(self, eris):
+        r''' Full-system drCCD (see `LNO.solve_rpa`); with k-point symmetry for the k-point
+        integrals of `ao2mo_k`, returning the dressed integrals as a `_KLNODFKERIS`.
+        '''
+        if not isinstance(eris, _KLNODFKERIS):
+            return LNO.solve_rpa(self, eris)
+        log = logger.new_logger(self)
+        mrpa = self.DRPA()
+        J, D = eris.get_ovJ()
+        mrpa.converged, U = kdriccd.kernel(mrpa, J, D, minus=eris.kconserv[0,:,0])
+        if not mrpa.converged:
+            log.warn('drCCD did not converge, please be careful of the results.')
+        self.e_corr_rpa_full = float(kdriccd.energy(U, J, len(J)))
+        log.note('Full-system k-point drCCD (%s):  converged = %s  E_corr(RPA) = %.15g',
+                 mrpa.solver, mrpa.converged, self.e_corr_rpa_full)
+        if mrpa.with_sosex:
+            self.e_corr_sosex_full = kdriccd.energy_sosex_and_t2(
+                U, J, eris.mo_energy_occ, eris.mo_energy_vir, eris.kconserv, False)[0]
+            log.note('Full-system k-point drCCD:  E_corr(SOSEX) = %.15g',
+                     self.e_corr_sosex_full)
+        self._chk_dump_full()
+        J = None
+        return eris.dress(U)
+
+    def _lno_amp_eris(self, eris):
+        if self._lno_uses_rpa and isinstance(eris, _KLNODFKERIS):
+            if self._rpa_eris is None or self._rpa_eris[0] is not eris:
+                self._rpa_eris = (eris, self.solve_rpa(eris))
+            return self._rpa_eris[1]
+        return LNO._lno_amp_eris(self, eris)
 
     def get_ovJ(self, orbocc, orbvir):
         r''' Real DF integrals J[i,a,P] of the real supercell orbitals `orbocc` and
@@ -299,6 +332,38 @@ class _KLNODFKERIS(lib.StreamObject):
                     out = _ao2mo.r_e2(Lpq, mo, (0,nocc,nocc,nocc+nvir), [], None)
                     self.Lov[ki,ka] = out.reshape(-1,nocc,nvir) / nkpts**0.5
         return self
+
+    def get_ovJ(self):
+        r''' The integrals in the layout of `pyscf.pbc.regpt2.kdriccd`: per momentum
+        transfer q, J_q (Nk*nocc*nvir, naux_q) and D_q = e_a - e_i of the excitations
+        (k_i, i, a), k_a = k_i + q.
+        '''
+        nkpts = len(self.mo_energy_occ)
+        J, D = [], []
+        for kq in range(nkpts):
+            kas = [self.kconserv[ki,0,kq] for ki in range(nkpts)]
+            J.append(np.vstack([self.Lov[ki,ka].reshape(self.Lov[ki,ka].shape[0],-1).T
+                                for ki,ka in enumerate(kas)]))
+            D.append(np.concatenate([lib.direct_sum('a-i->ia', self.mo_energy_vir[ka],
+                                                    self.mo_energy_occ[ki]).ravel()
+                                     for ki,ka in enumerate(kas)]))
+        return J, D
+
+    def dress(self, U):
+        r''' A copy whose integrals are the drCCD dressed integrals U_q (see
+        `pyscf.pbc.regpt2.kdriccd`): Lov[ki,ka] = conj(U_q) of the excitations (ki,ka), so
+        that the MP2 amplitudes conj((ia|jb)) / D of `make_lo_rdm1_1h_k` are the drCCD ones.
+        '''
+        nkpts, nocc = self.mo_energy_occ.shape
+        nov = nocc * self.mo_energy_vir.shape[1]
+        eris = copy.copy(self)
+        eris.Lov = np.empty((nkpts,nkpts), dtype=object)
+        for ki in range(nkpts):
+            for ka in range(nkpts):
+                Uq = U[self.kconserv[ka,ki,0]][ki*nov:(ki+1)*nov]
+                eris.Lov[ki,ka] = np.ascontiguousarray(Uq.conj().T).reshape(-1,nocc,
+                                                                            nov//nocc)
+        return eris
 
 
 def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):
