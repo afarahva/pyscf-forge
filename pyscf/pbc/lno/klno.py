@@ -39,7 +39,7 @@ from pyscf import lib
 from pyscf.pbc.df.df import _load3c
 from pyscf import __config__
 
-from pyscf.lno import LNO
+from pyscf.lno import LNO, drpa
 from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh
 from pyscf.pbc.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
 
@@ -130,21 +130,29 @@ class KLNO(LNO):
         '''
         return 1. / len(self.kpts)
 
+    def get_ovJ(self, orbocc, orbvir):
+        r''' Real DF integrals J[i,a,P] of the real supercell orbitals `orbocc` and
+        `orbvir` (see `LNO.get_ovJ`), from the k-point DF integrals.
+        '''
+        eris = _KLNODFINCOREERIS(self.with_df, orbocc, orbvir, self.max_memory,
+                                 verbose=self.verbose, stdout=self.stdout)
+        eris.build()
+        return drpa.get_ovJ(eris)
+
+    # The dressed integrals of RPA/SOSEX are real and in core: molecular rdm1 code
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        if self._lno_amp in ('bws2', 'rpa', 'sosex'):  # real orbitals: molecular rdm1 code
+        if self._lno_uses_rpa:
             return LNO.make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         occ_lno_type)
-        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
-        return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
-                                kappa=kappa)
+        return make_lo_rdm1_occ(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
+                                uvir_loc, occ_lno_type)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        if self._lno_amp in ('bws2', 'rpa', 'sosex'):
+        if self._lno_uses_rpa:
             return LNO.make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         vir_lno_type)
-        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
-        return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
-                                kappa=kappa)
+        return make_lo_rdm1_vir(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
+                                uvir_loc, vir_lno_type)
 
 
 def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):

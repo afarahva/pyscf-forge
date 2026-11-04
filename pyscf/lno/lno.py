@@ -43,8 +43,7 @@ from pyscf import lib
 from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
-from pyscf.lno import rpa
-from pyscf.lno import bws2
+from pyscf.lno import drpa
 from pyscf.lno import domain
 from pyscf.lno.tools import df_loop
 
@@ -54,6 +53,9 @@ DEBUG_BLKSIZE = getattr(__config__, 'lnocc_DEBUG_BLKSIZE', False)
 
 
 MUTE_CHKFILE = getattr(__config__, 'lno_LNO_mute_chkfile', False)
+
+# low-level amplitudes (lno_amp / pt2_amp) and their energy labels
+PT2_LABELS = {'mp2': 'MP2', 'kappa-mp2': 'kappa-MP2', 'rpa': 'RPA', 'sosex': 'SOSEX'}
 
 
 def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=None,
@@ -112,18 +114,10 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
     delete_eris = mlno.delete_full_eris and eris_created_here
     if mlno.delete_full_eris and not eris_created_here:
         log.info('delete_full_eris: the integrals passed to kernel are kept')
-    if delete_eris and mlno._imp_uses_full_eris:
-        log.warn('delete_full_eris is ignored: the %s fragment energies need the '
-                 'full-system integrals', mlno._pt2_label)
-        delete_eris = False
     if delete_eris and nlas > 1:
-        log.info('delete_full_eris: the full-system integrals are rebuilt for each of the '
-                 '%d fragments that need LNOs', nlas)
-
-    # Transform the integrals now if any fragment needs LNOs or the full-system low-level
-    # amplitudes (RPA / BW-s2) still need solving.
-    if nlas > 0 or mlno._need_full_solve:
-        eris = mlno._full_eris(eris)
+        log.info('delete_full_eris: the full-system integrals%s are rebuilt for each of '
+                 'the %d fragments that need LNOs',
+                 ' and dRPA amplitudes' if mlno._lno_uses_rpa else '', nlas)
 
     cput2 = cput1 = (logger.process_clock(), logger.perf_counter())
 
@@ -134,7 +128,7 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
         # LNO active space: build it or reuse the one given
         if frag_lno[ifrag] is None:
-            if eris is None: eris = mlno._full_eris()   # released by delete_full_eris
+            if eris is None: eris = mlno.ao2mo()   # released by delete_full_eris
             orbloc, lno_param = _frag_orbloc(lo_coeff, loidx, ifrag, lno_thresh,
                                              lno_pct_occ, lno_norb)
             lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(eris, orbloc, lno_type,
@@ -154,11 +148,6 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
             log.info('Releasing the full-system integrals')
             mlno._release_full_eris(eris)
             eris = None
-
-        # the RPA/SOSEX fragment energies project the full-system integrals
-        if eris is None and mlno._imp_uses_full_eris:
-            eris = mlno.ao2mo()
-            eris_created_here = True
 
         # calculate domains/prune basis
         if mlno.prune_lno_basis:
@@ -201,8 +190,6 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
             mlno._vhf = None
             mlno._precompute()
 
-    # BW-s2's dressed integrals are only needed while LNOs are built
-    mlno._bws2 = None
     if eris is not None and eris_created_here:
         mlno._release_full_eris(eris)
     eris = None
@@ -256,7 +243,7 @@ def split_las(orbfrag, frozen, nocc):
     else:
         maskact[np.asarray(frozen, dtype=int)] = False
     maskocc = np.arange(nmo) < nocc
-    return orbfrag[:,maskact&maskocc], orbfrag[:,maskact&~maskocc]
+    return orbfrag[:,maskact & maskocc], orbfrag[:,maskact & ~maskocc]
 
 def join_las(lno_occ, lno_vir, mo_coeff, mo_occ, s1e, orbloc):
     r''' Inverse of `split_las`: the LAS (orbfrag, frozen, uocc_loc) as returned by
@@ -518,30 +505,22 @@ class LNO(lib.StreamObject):
 
         # low-level amplitudes
         #   lno_amp : amplitudes for the LNO density matrices
-        #             'mp2', 'kappa-mp2', 'bws2', 'rpa' or 'sosex' ('rpa' and 'sosex'
+        #             'mp2', 'kappa-mp2', 'rpa' or 'sosex' ('rpa' and 'sosex'
         #             both use the drCCD amplitudes; they differ only in the energy)
         #   pt2_amp : amplitudes for the fragment PT2 energy and the impurity CC guess;
         #             None uses lno_amp, otherwise one of the lno_amp choices
+        #   kappa   : kappa-MP2 regularization strength, arXiv:2508.15744
+        #   rpa_solver : drCCD solver, 'eig' or 'riccati' (other settings are the defaults
+        #             of `pyscf.lno.drpa.DRPA`)
         self.lno_amp = 'mp2'
         self.pt2_amp = None
-        self.kappa = 1.1        # kappa-MP2 regularization strength, arXiv:2508.15744
-        self.alpha = 1.0        # BW-s2(alpha) regularizer strength, arXiv:2309.01376
-        # BW-s2 solver; full-system energy (per unit cell for KLNO) set when solved
-        self.bws2_max_cycle = 50
-        self.bws2_conv_tol = 1e-8
-        self.e_corr_bws2_full = None
-        self._bws2 = None
-        # drCCD solver, arXiv:2601.00131
-        self.rpa_cd_thresh = 1e-6   # Cholesky threshold for the drCCD energy denominator
-        self.rpa_max_cycle = 100
-        self.rpa_conv_tol = 1e-8
-        self.rpa_conv_tol_normu = 1e-6
-        self.rpa_diis_space = 8
-        self.rpa_damp = 0.
-        # full-system drCCD energies (per unit cell for KLNO), set when drCCD is solved
+        self.kappa = 1.1
+        self.rpa_solver = 'eig'
+        # full-system dRPA and SOSEX energies (per unit cell for KLNO), set when the
+        # full-system drCCD is solved for the LNOs (lno_amp 'rpa' / 'sosex')
         self.e_corr_rpa_full = None
-        self.e_corr_sosex_full = None   # only if pt2_amp resolves to 'sosex'
-        self._rpa_amp = None
+        self.e_corr_sosex_full = None
+        self._rpa_eris = None
 
         # df eri
         self._ovL = None
@@ -552,9 +531,9 @@ class LNO(lib.StreamObject):
         #   delete_full_eris : release the full-system integrals (only needed to build the
         #                      LNOs) before each impurity problem, leaving the memory to the
         #                      impurity solver. They are rebuilt for the next fragment that
-        #                      needs LNOs, so this suits runs with one or few fragments per
-        #                      job. Ignored if the fragment energies need the integrals
-        #                      (pt2_amp 'rpa' / 'sosex').
+        #                      needs LNOs (with the full-system drCCD for lno_amp 'rpa' /
+        #                      'sosex'), so this suits runs with one or few fragments per
+        #                      job.
         self.delete_full_eris = False
 
         # checkpoint and restart
@@ -667,13 +646,8 @@ class LNO(lib.StreamObject):
         log.info('lno_amp = %s  pt2_amp = %s', self._lno_amp, self._pt2_amp)
         if 'kappa-mp2' in (self._lno_amp, self._pt2_amp):
             log.info('kappa = %s', self.kappa)
-        if 'bws2' in (self._lno_amp, self._pt2_amp):
-            log.info('alpha = %s  bws2_max_cycle = %d  bws2_conv_tol = %g',
-                     self.alpha, self.bws2_max_cycle, self.bws2_conv_tol)
         if self._lno_uses_rpa or self._pt2_uses_rpa:
-            log.info('rpa_cd_thresh = %g  rpa_max_cycle = %d  rpa_conv_tol = %g  '
-                     'rpa_diis_space = %d  rpa_damp = %g', self.rpa_cd_thresh,
-                     self.rpa_max_cycle, self.rpa_conv_tol, self.rpa_diis_space, self.rpa_damp)
+            log.info('rpa_solver = %s', self.rpa_solver)
         return self
 
     def kernel(self, eris=None):
@@ -713,7 +687,6 @@ class LNO(lib.StreamObject):
 
         self._precompute()
 
-        # the full-system RPA and BW-s2 problems are solved in `kernel`
 
         frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
                           self.lno_type, self.lno_thresh,
@@ -755,6 +728,16 @@ class LNO(lib.StreamObject):
 
             return eris
 
+    def get_ovJ(self, orbocc, orbvir):
+        r''' Real DF integrals J[i,a,P] of the orbitals `orbocc` and `orbvir`, with
+        (ia|jb) = sum_P J[i,a,P] J[j,b,P], built in core from the AO DF integrals (e.g. for
+        the active space of an impurity).
+        '''
+        eris = _LNODFINCOREERIS(self.with_df, orbocc, orbvir, self.max_memory,
+                                verbose=self.verbose, stdout=self.stdout)
+        eris.build()
+        return drpa.get_ovJ(eris)
+
     def make_lno_active_space(self, ifrag=None, eris=None):
         r''' Build the LNO active space of one or more fragments, without solving their
         impurity problems.
@@ -794,7 +777,8 @@ class LNO(lib.StreamObject):
         lno_norb = [[None, None]] * self.nfrag if self.lno_norb is None else self.lno_norb
 
         eris_built_here = eris is None
-        eris = self._full_eris(eris)
+        if eris_built_here:
+            eris = self.ao2mo()
 
         frag_lno = []
         for i in ifraglist:
@@ -803,56 +787,52 @@ class LNO(lib.StreamObject):
             lnofrag, frozen = self.make_las(eris, orbloc, self.lno_type, lno_param)[:2]
             frag_lno.append(self._pack_las(lnofrag, frozen))
 
-        self._bws2 = None
         if eris_built_here:
             self._release_full_eris(eris)
 
         return frag_lno[0] if single else frag_lno
 
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        if self._lno_uses_rpa:
-            return make_lo_rdm1_occ(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
-                                    uvir_loc, occ_lno_type)
-        if self._lno_amp == 'bws2':
-            # MP2 dm in the dressed occupied basis, rotated back
-            moeoccW, U, erisW = self.get_bws2(eris)
-            dm = make_lo_rdm1_occ(erisW, moeoccW, moevir, np.dot(U.T, uocc_loc), uvir_loc,
-                                  occ_lno_type)
-            return np.linalg.multi_dot((U, dm, U.T))
-        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
-        return make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type,
-                                kappa=kappa)
+        return make_lo_rdm1_occ(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
+                                uvir_loc, occ_lno_type)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        if self._lno_uses_rpa:
-            return make_lo_rdm1_vir(self.get_rpa_amp(eris), moeocc, moevir, uocc_loc,
-                                    uvir_loc, vir_lno_type)
-        if self._lno_amp == 'bws2':
-            moeoccW, U, erisW = self.get_bws2(eris)
-            return make_lo_rdm1_vir(erisW, moeoccW, moevir, np.dot(U.T, uocc_loc),
-                                    uvir_loc, vir_lno_type)
-        kappa = self.kappa if self._lno_amp == 'kappa-mp2' else None
-        return make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type,
-                                kappa=kappa)
+        return make_lo_rdm1_vir(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
+                                uvir_loc, vir_lno_type)
 
-    _AMP_TYPES = ('mp2', 'kappa-mp2', 'bws2', 'rpa', 'sosex')
+    def _lno_amp_eris(self, eris):
+        r''' The integrals the LNO density matrices of `lno_amp` are built from: `eris`
+        for MP2, otherwise a `_DressedERIS` damping the amplitudes (kappa-MP2) or holding the
+        dressed integrals of the full-system drCCD (RPA/SOSEX; solved once per `eris`).
+        '''
+        amp = self._lno_amp
+        if amp == 'kappa-mp2':
+            return _DressedERIS(eris, kappa=self.kappa)
+        if amp in ('rpa', 'sosex'):
+            if self._rpa_eris is None or self._rpa_eris[0] is not eris:
+                self._rpa_eris = (eris, _DressedERIS(eris, ovL=self.solve_rpa(eris)))
+            return self._rpa_eris[1]
+        return eris
+
+    _AMP_TYPES = tuple(PT2_LABELS)
+
+    def _check_amp(self, amp, name):
+        amp = str(amp).lower()
+        if amp not in self._AMP_TYPES:
+            raise ValueError('%s must be one of %s (got %s)' % (name, self._AMP_TYPES, amp))
+        if amp in ('rpa', 'sosex') and self.prune_lno_basis:
+            raise NotImplementedError('RPA/SOSEX amplitudes do not support prune_lno_basis.')
+        return amp
 
     @property
     def _lno_amp(self):
-        amp = str(self.lno_amp).lower()
-        if amp not in self._AMP_TYPES:
-            raise ValueError('lno_amp must be one of %s (got %s)' % (self._AMP_TYPES, amp))
-        return amp
+        return self._check_amp(self.lno_amp, 'lno_amp')
 
     @property
     def _pt2_amp(self):
         if self.pt2_amp is None:
             return self._lno_amp
-        amp = str(self.pt2_amp).lower()
-        if amp not in self._AMP_TYPES:
-            raise ValueError('pt2_amp must be None or one of %s (got %s)' %
-                             (self._AMP_TYPES, amp))
-        return amp
+        return self._check_amp(self.pt2_amp, 'pt2_amp')
 
     @property
     def _lno_uses_rpa(self):
@@ -864,82 +844,33 @@ class LNO(lib.StreamObject):
 
     @property
     def _pt2_label(self):
-        return {'mp2': 'MP2', 'kappa-mp2': 'kappa-MP2', 'bws2': 'BW-s2', 'rpa': 'RPA',
-                'sosex': 'SOSEX'}[self._pt2_amp]
+        return PT2_LABELS[self._pt2_amp]
 
     @property
     def _e_full_scale(self):
         r''' Factor converting a full-system energy to the units of the fragment sum. '''
         return 1.
 
-    @property
-    def _rpa_kwargs(self):
-        return dict(cd_thresh=self.rpa_cd_thresh, max_cycle=self.rpa_max_cycle,
-                    conv_tol=self.rpa_conv_tol, conv_tol_normu=self.rpa_conv_tol_normu,
-                    diis_space=self.rpa_diis_space, damp=self.rpa_damp)
+    def DRPA(self):
+        r''' The drCCD solver (`rpa_solver`) for the full system and the impurities. '''
+        return drpa.DRPA(solver=self.rpa_solver, max_memory=self.max_memory,
+                         verbose=self.verbose, stdout=self.stdout)
 
     def solve_rpa(self, eris):
-        r''' Full-system factorized drCCD. Sets `e_corr_rpa_full` (and `e_corr_sosex_full`
-        if pt2_amp is 'sosex') and caches the amplitudes used for LNO construction.
+        r''' Full-system drCCD from `eris`. Sets `e_corr_rpa_full` and `e_corr_sosex_full`
+        and returns the dressed integrals U[i,a,P] (see `pyscf.regmp.driccd`).
         '''
         log = logger.new_logger(self)
-        if self.prune_lno_basis:
-            raise NotImplementedError('RPA-based LNO does not support prune_lno_basis.')
-        if np.ndim(self.mo_occ) != 1:
-            raise NotImplementedError('RPA-based LNO is implemented for RHF only.')
-        moeocc, moevir = self.split_mo_energy()[1:3]
-        nocc, nvir = moeocc.size, moevir.size
-        J = rpa.get_ovJ(eris).reshape(nocc*nvir,-1)
-        eia = (moevir[None,:] - moeocc[:,None]).ravel()
-        conv, e_rpa, U, tau = rpa.kernel(J, eia, log=log, **self._rpa_kwargs)
-        self.e_corr_rpa_full = e_rpa * self._e_full_scale
-        log.note('Full-system drCCD:  converged = %s  E_corr(RPA) = %.15g',
-                 conv, self.e_corr_rpa_full)
-        if self._pt2_amp == 'sosex':
-            e_sosex = rpa.energy_sosex(U, J, tau, nocc, nvir, max_memory=self.max_memory)
-            self.e_corr_sosex_full = e_sosex * self._e_full_scale
+        mrpa = self.DRPA()
+        mrpa.kernel(drpa.get_ovJ(eris), *self.split_mo_energy()[1:3])
+        self.e_corr_rpa_full = mrpa.e_corr * self._e_full_scale
+        log.note('Full-system drCCD (%s):  converged = %s  E_corr(RPA) = %.15g',
+                 mrpa.solver, mrpa.converged, self.e_corr_rpa_full)
+        if mrpa.e_corr_sosex is not None:
+            self.e_corr_sosex_full = mrpa.e_corr_sosex * self._e_full_scale
             log.note('Full-system drCCD:  E_corr(SOSEX) = %.15g', self.e_corr_sosex_full)
-        J = None
-        if self._lno_uses_rpa:
-            self._rpa_amp = (eris, rpa._RPAAmpERIS(U.reshape(nocc,nvir,-1), tau,
-                                                   self.max_memory, verbose=self.verbose,
-                                                   stdout=self.stdout))
-        return e_rpa
-
-    def get_rpa_amp(self, eris):
-        if self._rpa_amp is None or self._rpa_amp[0] is not eris:
-            self.solve_rpa(eris)
-        return self._rpa_amp[1]
-
-    def solve_bws2(self, eris):
-        r''' Full-system BW-s2(alpha). Sets `e_corr_bws2_full` and caches the dressed
-        occupied energies, orbitals and DF integrals used for LNO construction.
-        '''
-        log = logger.new_logger(self)
-        if self.prune_lno_basis:
-            raise NotImplementedError('BW-s2-based LNO does not support prune_lno_basis.')
-        if np.ndim(self.mo_occ) != 1:
-            raise NotImplementedError('BW-s2-based LNO is implemented for RHF only.')
-        moeocc, moevir = self.split_mo_energy()[1:3]
-        J = rpa.get_ovJ(eris)
-        conv, e_corr, moeoccW, U = bws2.kernel(J, moeocc, moevir, alpha=self.alpha,
-                                               max_cycle=self.bws2_max_cycle,
-                                               conv_tol=self.bws2_conv_tol,
-                                               max_memory=self.max_memory, log=log)
-        self.e_corr_bws2_full = e_corr * self._e_full_scale
-        log.note('Full-system BW-s2(alpha=%g):  converged = %s  E_corr = %.15g',
-                 self.alpha, conv, self.e_corr_bws2_full)
-        erisW = None
-        if self._lno_amp == 'bws2':
-            erisW = bws2._DressedERIS(einsum('iax,iI->Iax', J, U), self.max_memory,
-                                      verbose=self.verbose, stdout=self.stdout)
-        self._bws2 = (eris, moeoccW, U, erisW)
-        return e_corr
-
-    def get_bws2(self, eris):
-        if self._bws2 is None or self._bws2[0] is not eris or self._bws2[3] is None:
-            self.solve_bws2(eris)
-        return self._bws2[1:]
+        self._chk_dump_full()
+        return mrpa.U
 
     def _precompute(self, *args, **kwargs):
         pass
@@ -960,48 +891,12 @@ class LNO(lib.StreamObject):
     def nmo(self):
         return self.get_nmo()
 
-    @property
-    def _imp_uses_full_eris(self):
-        r''' Whether the impurity problems need the full-system integrals: the RPA/SOSEX
-        fragment energies project them onto the active space.
-        '''
-        return self._pt2_uses_rpa
-
-    @property
-    def _need_rpa(self):
-        r''' Whether the full-system drCCD energies are still unknown. '''
-        return ((self._lno_uses_rpa or self._pt2_uses_rpa) and
-                (self.e_corr_rpa_full is None or
-                 (self._pt2_amp == 'sosex' and self.e_corr_sosex_full is None)))
-
-    @property
-    def _need_bws2(self):
-        r''' Whether the full-system BW-s2 energy is still unknown. '''
-        return 'bws2' in (self._lno_amp, self._pt2_amp) and self.e_corr_bws2_full is None
-
-    @property
-    def _need_full_solve(self):
-        return self._need_rpa or self._need_bws2
-
-    def _full_eris(self, eris=None):
-        r''' The full-system integrals for the LNOs, built via `ao2mo` if not given, with
-        the full-system RPA / BW-s2 problems solved if their energies are still unknown.
-        '''
-        if eris is None: eris = self.ao2mo()
-        need_rpa, need_bws2 = self._need_rpa, self._need_bws2
-        if need_rpa: self.solve_rpa(eris)
-        if need_bws2: self.solve_bws2(eris)
-        if need_rpa or need_bws2: self._chk_dump_full()
-        return eris
-
     def _release_full_eris(self, eris):
-        r''' Release full-system integrals built here, with the low-level amplitudes
-        cached on them.
+        r''' Release full-system integrals built here, with the dressed integrals cached
+        on them.
         '''
-        if self._bws2 is not None and self._bws2[0] is eris:
-            self._bws2 = None
-        if self._rpa_amp is not None and self._rpa_amp[0] is eris:
-            self._rpa_amp = None
+        if self._rpa_eris is not None and self._rpa_eris[0] is eris:
+            self._rpa_eris = None
         _release_eris(eris)
 
     def _pack_las(self, lnofrag, frozen):
@@ -1082,7 +977,7 @@ class LNO(lib.StreamObject):
 
     def _chk_dump_full(self):
         if self.chkfile:
-            for key in ('e_corr_bws2_full', 'e_corr_rpa_full', 'e_corr_sosex_full'):
+            for key in ('e_corr_rpa_full', 'e_corr_sosex_full'):
                 if getattr(self, key) is not None:
                     lib.chkfile.dump(self.chkfile, 'lno/'+key, getattr(self, key))
 
@@ -1090,8 +985,8 @@ class LNO(lib.StreamObject):
         r''' Restart from a chkfile written by `kernel` (default: `self.chkfile`).
 
         Sets `frag_lno` and `frag_eners` from the LNOs and energies of the fragments that
-        finished, and the full-system energies (`e_corr_bws2_full`, `e_corr_rpa_full`,
-        `e_corr_sosex_full`) that were computed, so that the next `kernel` call only
+        finished, and the full-system energies (`e_corr_rpa_full`, `e_corr_sosex_full`)
+        that were computed, so that the next `kernel` call only
         computes what is missing. If `self.chkfile` is the same file, the run continues
         writing to it.
         '''
@@ -1111,7 +1006,7 @@ class LNO(lib.StreamObject):
             if frag is not None:
                 self.frag_lno[ifrag] = frag.get('las')
                 self.frag_eners[ifrag] = frag.get('energy')
-        for key in ('e_corr_bws2_full', 'e_corr_rpa_full', 'e_corr_sosex_full'):
+        for key in ('e_corr_rpa_full', 'e_corr_sosex_full'):
             if key in dat:
                 setattr(self, key, float(dat[key]))
         self._chk_loaded = os.path.abspath(chkfile)
@@ -1165,7 +1060,9 @@ class _LNODFINCOREERIS:
         return self.orbvir.shape[1]
     @property
     def naux(self):
-        return self.with_df.get_naoaux()
+        if self.ovL is None:
+            return self.with_df.get_naoaux()
+        return self.ovL.shape[-1]
 
     def build(self):
         log = logger.new_logger(self)
@@ -1204,6 +1101,34 @@ class _LNODFINCOREERIS:
         for i0,i1 in lib.prange(0,nocc,occblksize):
             oVL[i0:i1] = lib.einsum('iax,aA->iAx', self.get_occ_blk(i0,i1), u)
         return oVL
+
+
+class _DressedERIS:
+    r''' An LNO ERI object as seen by the density matrices of non-MP2 amplitudes.
+
+    The LNO density matrices (see `make_lno_rdm1`) are built from MP2 amplitudes
+    t2 = (ia|jb) / (e_i + e_j - e_a - e_b) of the 3-index integrals of an ERI object. This
+    wraps the ERI object `eris` of any LNO class and either
+
+        damps the amplitudes, t2 *= 1 - exp(kappa * (e_i + e_j - e_a - e_b))   (kappa-MP2)
+
+    or replaces its integrals by the in-core, real dressed integrals `ovL`, U = (1 + 2T) J,
+    whose MP2 amplitudes are the drCCD ones (dRPA, see `pyscf.regmp.driccd`).
+    '''
+    def __init__(self, eris, kappa=None, ovL=None):
+        if ovL is not None:
+            ovL_eris = _LNODFINCOREERIS(None, eris.orbocc, eris.orbvir, eris.max_memory,
+                                        verbose=eris.verbose, stdout=eris.stdout)
+            ovL_eris.ovL = np.asarray(ovL, dtype=np.float64)
+            ovL_eris.dtype, ovL_eris.dsize = np.float64, 8
+            eris = ovL_eris
+        self._eris = eris
+        self.kappa = kappa
+
+    def __getattr__(self, key):
+        if key == '_eris':
+            raise AttributeError(key)
+        return getattr(self._eris, key)
 
 
 class _LNODFOUTCOREERIS(_LNODFINCOREERIS):

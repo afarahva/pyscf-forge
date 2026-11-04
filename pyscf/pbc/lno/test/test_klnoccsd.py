@@ -255,6 +255,77 @@ class ShiftedKmesh(unittest.TestCase):
         for key in ['efrag_pt2', 'efrag_cc', 'efrag_cc_t']:
             self.assertAlmostEqual(abs(getattr(m2, key) - getattr(m1, key)).max(), 0, 9)
 
+    def _slno(self, smf, lo_coeff, frag_lolist, nkpts, **kwargs):
+        ''' LNO-CCSD of the k2s supercell with the fragments of all unit cells. '''
+        nlo = lo_coeff.shape[1] // nkpts
+        sfrag_lolist = [[r*nlo+i for i in f] for r in range(nkpts) for f in frag_lolist]
+        mcc = LNOCCSD(smf, lo_coeff, sfrag_lolist)
+        mcc.kwargs_imp = {'conv_tol': 1e-10, 'conv_tol_normt': 1e-8}
+        return mcc.set(**kwargs).run()
+
+    def test_klno_rpa_complete_space(self):
+        ''' Without truncation, the fragment RPA/SOSEX energies sum to the full-system ones. '''
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        for amp in ('rpa', 'sosex'):
+            mcc = self._klno(kmf, ccsd_t=False, lno_amp=amp)[0]
+            self.assertAlmostEqual(mcc.e_corr_rpa_full, -0.0544204935, 8)
+            self.assertAlmostEqual(mcc.e_corr_sosex_full, -0.0274798566, 8)
+            efull = mcc.e_corr_rpa_full if amp == 'rpa' else mcc.e_corr_sosex_full
+            self.assertAlmostEqual(mcc.e_corr_pt2, efull, 8)
+
+    def test_klno_rpa_matches_supercell(self):
+        ''' KLNO with drCCD amplitudes (real orbitals) against LNO of the k2s supercell. '''
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        smf = k2s_scf(kmf)
+        nkpts = len(kmf.kpts)
+        thresh = [1e-5, 1e-6]
+        for amp in ('rpa', 'sosex'):
+            kmcc, lo_coeff, frag_lolist = self._klno(kmf, smf, ccsd_t=False, lno_thresh=thresh,
+                                                     lno_amp=amp)
+            mcc = self._slno(smf, lo_coeff, frag_lolist, nkpts, lno_thresh=thresh, lno_amp=amp)
+            self.assertAlmostEqual(kmcc.e_corr_rpa_full, mcc.e_corr_rpa_full/nkpts, 8)
+            self.assertAlmostEqual(kmcc.e_corr_sosex_full, mcc.e_corr_sosex_full/nkpts, 8)
+            self.assertAlmostEqual(kmcc.e_corr_pt2, mcc.e_corr_pt2/nkpts, 7)
+            self.assertAlmostEqual(kmcc.e_corr_ccsd, mcc.e_corr_ccsd/nkpts, 7)
+
+    def test_klno_kappa_mp2(self):
+        ''' kappa-MP2 amplitudes with real and complex k-point orbitals: a huge kappa
+            reproduces MP2, and kappa = 1.1 matches LNO of the k2s supercell.
+        '''
+        thresh = [1e-5, 1e-6]
+        ref = [-0.0334853473, -0.0482735652]    # MP2 amplitudes, see test_klnoccsd_t_outcore
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        smf = k2s_scf(kmf)
+        nkpts = len(kmf.kpts)
+        mcc = self._klno(kmf, smf, ccsd_t=False, lno_thresh=thresh, lno_amp='kappa-mp2',
+                         kappa=1e6)[0]
+        self.assertAlmostEqual(mcc.e_corr_pt2, ref[0], 8)
+        self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 8)
+        kmcc, lo_coeff, frag_lolist = self._klno(kmf, smf, ccsd_t=False, lno_thresh=thresh,
+                                                 lno_amp='kappa-mp2')
+        mcc = self._slno(smf, lo_coeff, frag_lolist, nkpts, lno_thresh=thresh,
+                         lno_amp='kappa-mp2')
+        self.assertAlmostEqual(kmcc.e_corr_pt2, mcc.e_corr_pt2/nkpts, 7)
+        self.assertAlmostEqual(kmcc.e_corr_ccsd, mcc.e_corr_ccsd/nkpts, 7)
+        self.assertNotAlmostEqual(kmcc.e_corr_pt2, ref[0], 4)
+
+        # complex orbitals (k-mesh not closed under k -> -k; LNOs only, as the impurity
+        # CCSD needs real orbitals): no drCCD amplitudes
+        kmf = self._kmf([2,1,1], [0.1,0,0])
+        smf = k2s_scf(kmf)
+        def make_las(**kwargs):
+            return self._klno(kmf, smf, ccsd_t=False, lno_thresh=thresh, run=lambda mcc: None,
+                              **kwargs)[0].make_lno_active_space()
+        proj = lambda c: np.dot(c, c.T.conj())
+        las0 = make_las()
+        las1 = make_las(lno_amp='kappa-mp2', kappa=1e6)
+        self.assertTrue(np.iscomplexobj(las0[0]['lno_occ']))
+        for x0, x1 in zip(las0, las1):
+            for key in ('lno_occ', 'lno_vir'):
+                self.assertAlmostEqual(abs(proj(x1[key]) - proj(x0[key])).max(), 0, 8)
+        with self.assertRaises(NotImplementedError):
+            make_las(lno_amp='rpa')
+
 
 
 if __name__ == "__main__":

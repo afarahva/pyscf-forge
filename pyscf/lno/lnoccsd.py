@@ -35,9 +35,9 @@ from pyscf.lib import logger
 from pyscf import lib
 
 from pyscf.lno import LNO
-from pyscf.lno.regmp2 import kappa_factor
-from pyscf.lno import rpa as rpa_mod
-from pyscf.lno import bws2
+from pyscf.regmp.kappamp2 import kappa_factor
+from pyscf.lno import drpa
+from pyscf.lno.lno import PT2_LABELS
 from pyscf.lno.tools import df_loop
 
 _fdot = np.dot
@@ -485,10 +485,10 @@ class MODIFIED_DFCCSD_complex:
 
 ''' impurity solver for LNO-based CCSD/CCSD_T
 '''
-def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
+def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris=None,
                    ccsd_t=False, log=None, verbose_imp=None,
-                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None,
-                   rpa=None, rpa_kwargs=None, s1e=None, bws2_alpha=None, bws2_kwargs=None):
+                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000,
+                   pt2_amp='mp2', kappa=None, mrpa=None, ovJ=None):
     r''' Solve impurity problem and calculate local correlation energy.
 
     Args:
@@ -499,20 +499,11 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
         ccsd_t (bool):
             If True, CCSD(T) energy is calculated and returned as the third
             item (0 is returned otherwise).
-        frozen (int or list; optional):
-            Same syntax as `frozen` in MP2, CCSD, etc.
-        kappa (float; optional):
-            If given, kappa-MP2 amplitudes replace the MP2 ones in the fragment energy
-            and the CCSD guess.
-        rpa (str; optional):
-            'rpa' or 'sosex': the active-space drCCD amplitudes replace the MP2 ones in
-            the fragment energy and the CCSD guess. The energy is the direct RPA one,
-            2 sum T V ('rpa'), or includes SOSEX exchange, sum T (2V - V_x) ('sosex').
-            The active-space DF integrals are obtained by projecting those of `eris`
-            (requires `s1e`).
-        bws2_alpha (float; optional):
-            If given, BW-s2(alpha) amplitudes of the active space replace the MP2 ones
-            in the fragment energy and the CCSD guess.
+        eris:
+            Not used (full-system integrals of the LNO `impurity_solve` interface).
+        pt2_amp, kappa, mrpa, ovJ:
+            Low-level amplitudes for the fragment PT2 energy and the CCSD guess, see
+            `get_impurity_pt2`.
 
     Return:
         e_loc_corr_pt2, e_loc_corr_ccsd, e_loc_corr_ccsd_t:
@@ -559,46 +550,10 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
             ovov = None
             cput1 = log.timer_debug1('imp sol - eri    ', *cput1)
 
-            # MP2 fragment energy
-            t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
-            if kappa is None:
-                t2_ene = t2
-            else:
-                # kappa-MP2: regularize the init MP2 amplitudes (kappa-t2) used to
-                # seed the CCSD. The amplitude carries a single factor g; the
-                # fragment energy, being quadratic in the amplitude, carries g**2.
-                mo_e = imp_eris.mo_energy
-                eia = mo_e[:nactocc,None] - mo_e[None,nactocc:]
-                g = kappa_factor(lib.direct_sum('ia,jb->ijab', eia, eia), kappa)
-                t2 *= g
-                t2_ene = t2 * g
-            cput1 = log.timer_debug1('imp sol - mp2 amp', *cput1)
-            if bws2_alpha is not None:
-                # BW-s2: dressed active-space amplitudes, rotated back to the impurity
-                # orbitals, give the fragment energy and seed the CCSD.
-                mo_e = np.asarray(imp_eris.mo_energy).real
-                converged, t2 = bws2.kernel_dense(oovv, mo_e[:nactocc], mo_e[nactocc:],
-                                                  alpha=bws2_alpha, log=log,
-                                                  **(bws2_kwargs or {}))[::4]
-                if not converged:
-                    log.warn('Impurity BW-s2 did not converge, please be careful of the '
-                             'results.')
-                cput1 = log.timer_debug1('imp sol - bws2 amp', *cput1)
-                elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
-            elif rpa is not None:
-                # drCCD: the active-space RPA amplitudes give the fragment energy
-                # and seed the CCSD.
-                t2 = get_impurity_rpa_t2(eris, orbactocc, orbactvir, s1e,
-                                         imp_eris.mo_energy, log, rpa_kwargs)
-                cput1 = log.timer_debug1('imp sol - drccd amp', *cput1)
-                if rpa == 'sosex':
-                    elcorr_pt2 = get_fragment_energy(oovv, t2, uocc_loc).real
-                else:
-                    elcorr_pt2 = rpa_mod.get_fragment_energy_rpa(oovv, t2, uocc_loc)
-            else:
-                elcorr_pt2 = get_fragment_energy(oovv, t2_ene, uocc_loc).real
-            t2_ene = None
-            cput1 = log.timer_debug1('imp sol - mp2 ene', *cput1)
+            # low-level fragment energy
+            t1, t2, elcorr_pt2 = get_impurity_pt2(mcc, imp_eris, oovv, uocc_loc, pt2_amp,
+                                                  kappa, mrpa, ovJ)
+            cput1 = log.timer_debug1('imp sol - pt2    ', *cput1)
 
             # CCSD fragment energy
             t1, t2 = mcc.kernel(eris=imp_eris, t1=t1, t2=t2)[1:]
@@ -627,33 +582,48 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
 
         t1 = t2 = oovv = imp_eris = mcc = None
 
-    pt2_label = ('BW-s2' if bws2_alpha is not None else rpa.upper() if rpa is not None
-                 else 'kappa-MP2' if kappa is not None else 'MP2')
-    frag_msg = '  '.join([f'E_corr({pt2_label}) = {elcorr_pt2:.15g}',
+    frag_msg = '  '.join([f'E_corr({PT2_LABELS[pt2_amp]}) = {elcorr_pt2:.15g}',
                           f'E_corr(CCSD) = {elcorr_cc:.15g}',
                           f'E_corr(CCSD(T)) = {elcorr_cc_t:.15g}'])
 
     return (elcorr_pt2, elcorr_cc, elcorr_cc_t), frag_msg
 
-def get_impurity_rpa_t2(eris, orbactocc, orbactvir, s1e, mo_energy, log, rpa_kwargs=None):
-    r''' Active-space drCCD amplitudes t2[i,j,a,b] using the DF integrals of the
-    full-system `eris` projected onto the (semi-canonical) active orbitals.
+def get_impurity_pt2(mcc, imp_eris, oovv, uocc_loc, pt2_amp='mp2', kappa=None, mrpa=None,
+                     ovJ=None):
+    r''' Low-level amplitudes of an impurity problem: the CCSD guess (t1, t2) and the
+    fragment energy.
+
+    Args:
+        pt2_amp (str):
+            'mp2'       : MP2.
+            'kappa-mp2' : kappa-MP2 with regularization strength `kappa`; the amplitudes
+                          carry one factor 1 - exp(-kappa*Delta) and the energy two.
+            'rpa'       : drCCD of the active space, solved by `mrpa` (`lno.drpa.DRPA`)
+                          from its DF integrals `ovJ` (nocc, nvir, naux); the energy is the
+                          direct RPA one, 2 sum T V.
+            'sosex'     : as 'rpa', with the SOSEX energy sum T (2V - V_x).
+
+    Return:
+        t1, t2, e_pt2
     '''
-    if s1e is None:
-        raise ValueError('s1e is required for the impurity drCCD.')
-    if rpa_kwargs is None: rpa_kwargs = {}
-    nactocc, nactvir = orbactocc.shape[1], orbactvir.shape[1]
-    uocc = fdot(eris.orbocc.T.conj(), s1e, orbactocc).real
-    uvir = fdot(eris.orbvir.T.conj(), s1e, orbactvir).real
-    J = rpa_mod.get_ovJ_act(eris, uocc, uvir).reshape(nactocc*nactvir,-1)
-    mo_e = np.asarray(mo_energy).real
-    eia = (mo_e[None,nactocc:] - mo_e[:nactocc,None]).ravel()
-    conv, e_rpa, U, tau = rpa_mod.kernel(J, eia, log=log, **rpa_kwargs)
-    if not conv:
-        log.warn('Impurity drCCD did not converge, please be careful of the results.')
-    log.debug('    impsol:  active-space E_corr(RPA) = %.15g', e_rpa)
-    J = None
-    return rpa_mod.make_t2(U, tau, nactocc, nactvir)
+    t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
+    nocc = t2.shape[0]
+    mo_e = np.asarray(imp_eris.mo_energy).real
+    if pt2_amp == 'kappa-mp2':
+        eia = mo_e[:nocc,None] - mo_e[None,nocc:]
+        g = kappa_factor(lib.direct_sum('ia,jb->ijab', eia, eia), kappa)
+        t2 *= g
+        e_pt2 = get_fragment_energy(oovv, t2*g, uocc_loc)
+    elif pt2_amp in ('rpa', 'sosex'):
+        mrpa.kernel(ovJ, mo_e[:nocc], mo_e[nocc:])
+        t2 = mrpa.make_t2(mo_e[:nocc], mo_e[nocc:])
+        if pt2_amp == 'sosex':
+            e_pt2 = get_fragment_energy(oovv, t2, uocc_loc)
+        else:
+            e_pt2 = drpa.get_fragment_energy_rpa(oovv, t2, uocc_loc)
+    else:
+        e_pt2 = get_fragment_energy(oovv, t2, uocc_loc)
+    return t1, t2, e_pt2
 
 def get_maskact(frozen, nmo):
     # Convert frozen to 0 bc PySCF solvers do not support frozen=None or empty list
@@ -759,18 +729,24 @@ class LNOCCSD(LNO):
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
                               max_las_size_ccsd_t=self._max_las_size_ccsd_t,
-                              **self._pt2_impurity_kwargs)
+                              **self._pt2_impurity_kwargs(mo_coeff, mo_occ, maskact))
 
-    @property
-    def _pt2_impurity_kwargs(self):
-        r''' Low-level amplitude arguments of `impurity_solve` from `pt2_amp`. '''
+    def _pt2_impurity_kwargs(self, mo_coeff, mo_occ, maskact):
+        r''' Low-level amplitude arguments of `impurity_solve` (see `get_impurity_pt2`).
+        For RPA/SOSEX, the DF integrals of the active space are built from the AO ones.
+        '''
         pt2_amp = self._pt2_amp
-        return dict(kappa=self.kappa if pt2_amp == 'kappa-mp2' else None,
-                    rpa=pt2_amp if self._pt2_uses_rpa else None,
-                    rpa_kwargs=self._rpa_kwargs, s1e=self.s1e,
-                    bws2_alpha=self.alpha if pt2_amp == 'bws2' else None,
-                    bws2_kwargs=dict(max_cycle=self.bws2_max_cycle,
-                                     conv_tol=self.bws2_conv_tol))
+        kwargs = dict(pt2_amp=pt2_amp, kappa=self.kappa)
+        if pt2_amp in ('rpa', 'sosex'):
+            maskocc = mo_occ > 1e-10
+            orbactocc = mo_coeff[:,maskact & maskocc]
+            orbactvir = mo_coeff[:,maskact & ~maskocc]
+            if orbactocc.shape[1] > 0 and orbactvir.shape[1] > 0:
+                kwargs['mrpa'] = mrpa = self.DRPA()
+                mrpa.with_sosex = False
+                mrpa.verbose = self.verbose_imp
+                kwargs['ovJ'] = self.get_ovJ(orbactocc, orbactvir)
+        return kwargs
 
     def _post_proc(self, frag_res, frag_wghtlist):
         ''' Post processing results returned by `impurity_solve` collected in `frag_res`.

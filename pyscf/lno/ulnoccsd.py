@@ -26,7 +26,8 @@ from pyscf.mp.ump2 import get_frozen_mask
 from pyscf.lno.ulno import ULNO
 from pyscf.lno import lnoccsd
 from pyscf.lno.lnoccsd import LNOCCSD, LNOCCSD_T
-from pyscf.lno.regmp2 import kappa_factor
+from pyscf.regmp.kappamp2 import kappa_factor
+from pyscf.lno.lno import PT2_LABELS
 
 einsum = lib.einsum
 
@@ -321,9 +322,13 @@ def _make_df_eris_outcore(mycc, mo_coeff=None):
     return eris
 
 
-def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
+def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris=None,
                    ccsd_t=False, log=None, verbose_imp=None,
-                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000, kappa=None):
+                   max_las_size_ccsd=1000, max_las_size_ccsd_t=1000,
+                   pt2_amp='mp2', kappa=None):
+    r''' Solve the unrestricted impurity problem; see `lnoccsd.impurity_solve`. The
+    low-level amplitudes `pt2_amp` are 'mp2' or 'kappa-mp2' (strength `kappa`).
+    '''
 
     log = logger.new_logger(mcc if log is None else log)
     cput1 = (logger.process_clock(), logger.perf_counter())
@@ -365,7 +370,7 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
         cput1 = log.timer_debug1('imp sol - eri    ', *cput1)
         # MP2 fragment energy
         t1, t2 = mcc.init_amps(eris=imp_eris)[1:]
-        if kappa is None:
+        if pt2_amp != 'kappa-mp2':
             t2_ene = t2
         else:
             # kappa-MP2: regularize the init MP2 amplitudes (kappa-t2) used to
@@ -399,7 +404,7 @@ def impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris,
         else:
             elcorr_cc_t = 0.
 
-    frag_msg = '  '.join([f'E_corr(MP2) = {elcorr_pt2:.15g}',
+    frag_msg = '  '.join([f'E_corr({PT2_LABELS[pt2_amp]}) = {elcorr_pt2:.15g}',
                           f'E_corr(CCSD) = {elcorr_cc:.15g}',
                           f'E_corr(CCSD(T)) = {elcorr_cc_t:.15g}'])
 
@@ -481,11 +486,11 @@ class ULNOCCSD(ULNO, LNOCCSD):
         if self.kwargs_imp is not None:
             mcc = mcc.set(**self.kwargs_imp)
 
-        kappa = self.kappa if self._pt2_amp == 'kappa-mp2' else None
         return impurity_solve(mcc, mo_coeff, uocc_loc, mo_occ, maskact, eris, log=log,
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
-                              max_las_size_ccsd_t=self._max_las_size_ccsd_t, kappa=kappa)
+                              max_las_size_ccsd_t=self._max_las_size_ccsd_t,
+                              **self._pt2_impurity_kwargs(mo_coeff, mo_occ, maskact))
 
 
 class ULNOCCSD_T(ULNOCCSD, LNOCCSD_T):

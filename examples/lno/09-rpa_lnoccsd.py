@@ -7,12 +7,18 @@ default pt2_amp = None the same amplitudes also give the fragment low-level ener
 and the impurity CCSD guess. 'rpa' uses the direct RPA energy 2 sum T V; 'sosex'
 uses the same drCCD amplitudes with the SOSEX energy sum T (2V - V_x).
 
-The full-system drCCD is solved once with a factorized O(N^4) algorithm
-(T = -D^{-1} o (U U^T), Cholesky-decomposed denominator). Its energy is stored in
-`e_corr_rpa_full` (and `e_corr_sosex_full` for 'sosex') and is passed to the
-external correction like the full-system MP2 energy:
+The full-system drCCD is solved once, by diagonalizing the RPA matrix (default,
+`rpa_solver = 'eig'`, O(N^6)) or iteratively (`rpa_solver = 'riccati'`, O(N^4) per
+cycle). Its dressed integrals U = (1 + 2T) J give the drCCD amplitudes in the MP2 form
+t = (U_ia . U_jb) / (e_i + e_j - e_a - e_b), so the LNO density matrices are those of
+MP2 with J replaced by U. The impurity drCCD uses the DF integrals of the active space.
+The full-system dRPA and SOSEX energies are stored in `e_corr_rpa_full` and
+`e_corr_sosex_full` and are passed to the external correction like the full-system
+MP2 energy:
 
     E_corr(LNO-CCSD + dRPA) = mlno.e_corr_ccsd_pt2corrected(mlno.e_corr_rpa_full)
+
+(the same energies as the canonical `pyscf.regmp.DRICCD`).
 
 For periodic systems, use KLNOCCSD with real orbitals (Gamma point or time-reversal
 symmetric k-meshes); see examples 03 and 08 for the setup.

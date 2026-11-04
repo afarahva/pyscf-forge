@@ -7,7 +7,7 @@ Checkpoint / restart for LNO calculations.
   * after a fragment's LNO active space is built  -> 'lno/frag<i>/las'
     (unless `save_lno = False`, e.g. when the LNO active spaces are very large)
   * after its impurity problem is solved          -> 'lno/frag<i>/energy'
-plus any full-system low-level energies (RPA / BW-s2).  A later run reads this file with
+plus any full-system low-level energies (RPA / SOSEX).  A later run reads this file with
 `load_chk()`, which populates `frag_lno` (LNOs that are built) and `frag_eners` (fragments
 that are finished); both can also be set by hand.  The next `kernel()` then only computes
 what is missing:

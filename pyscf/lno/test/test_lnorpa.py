@@ -17,8 +17,10 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, cc, lo, lib
-from pyscf.lno import LNOCCSD, rpa
+from pyscf.lno import LNOCCSD, ULNOCCSD, drpa
 from pyscf.lno import make_lno_rdm1
+from pyscf.lno.lno import _DressedERIS
+from pyscf.regmp import driccd
 
 
 def exact_drccd(V, eia):
@@ -107,52 +109,60 @@ class WaterDimerRPA(unittest.TestCase):
     def _full_drccd(self, mlno, eris):
         moeocc, moevir = mlno.split_mo_energy()[1:3]
         nocc, nvir = moeocc.size, moevir.size
-        J = rpa.get_ovJ(eris).reshape(nocc*nvir,-1)
+        J = drpa.get_ovJ(eris).reshape(nocc*nvir,-1)
         eia = (moevir[None,:] - moeocc[:,None]).ravel()
-        return J, eia, nocc, nvir
+        return J, eia, moeocc, moevir
 
     def test_drccd_vs_exact(self):
         mlno = self._lno()
         eris = mlno.ao2mo()
-        J, eia, nocc, nvir = self._full_drccd(mlno, eris)
+        J, eia, moeocc, moevir = self._full_drccd(mlno, eris)
+        nocc, nvir = moeocc.size, moevir.size
         V = np.dot(J, J.T)
         T = exact_drccd(V, eia)
         e_ref = 2*np.sum(T*V)
         Vx = V.reshape(nocc,nvir,nocc,nvir).transpose(0,3,2,1).reshape(nocc*nvir,-1)
         esx_ref = np.sum(T*(2*V-Vx))
 
-        conv, e_rpa, U, tau = rpa.kernel(J, eia, cd_thresh=1e-9, conv_tol=1e-11,
-                                         conv_tol_normu=1e-8)
+        conv, U_ric = driccd.kernel_riccati(J, eia, cd_thresh=1e-9, conv_tol=1e-11,
+                                            conv_tol_normu=1e-8)
         self.assertTrue(conv)
-        self.assertAlmostEqual(e_rpa, e_ref, 8)
-        self.assertAlmostEqual(rpa.energy(U, J), e_ref, 8)
-        t2 = rpa.make_t2(U, tau, nocc, nvir)
-        self.assertAlmostEqual(abs(t2.transpose(0,2,1,3).reshape(nocc*nvir,-1)-T).max(), 0, 7)
-        self.assertAlmostEqual(rpa.energy_sosex(U, J, tau, nocc, nvir), esx_ref, 8)
+        for U in (U_ric, driccd.kernel_eig(J, eia)):
+            self.assertAlmostEqual(driccd.energy(U, J), e_ref, 8)
+            t2 = driccd.make_t2(U.reshape(nocc,nvir,-1), moeocc, moevir)
+            self.assertAlmostEqual(abs(t2.transpose(0,2,1,3).reshape(nocc*nvir,-1)-T).max(), 0, 7)
+            self.assertAlmostEqual(driccd.energy_sosex(U, J, moeocc, moevir), esx_ref, 8)
 
-    def test_rdm1_rpa_amp(self):
+    def test_rdm1_dressed_eris(self):
         # force blocking in the rdm1 code (module-level flag, restored afterwards)
         with lib.temporary_env(make_lno_rdm1, DEBUG_BLKSIZE=True):
-            self._test_rdm1_rpa_amp()
+            self._test_rdm1_dressed_eris()
 
-    def _test_rdm1_rpa_amp(self):
+    def _test_rdm1_dressed_eris(self):
+        # With rotations of the whole occupied/virtual space, the LNO density matrices of
+        # the dressed integrals are those of the drCCD / kappa-MP2 amplitudes.
         mlno = self._lno()
         eris = mlno.ao2mo()
-        J, eia, nocc, nvir = self._full_drccd(mlno, eris)
-        conv, e_rpa, U, tau = rpa.kernel(J, eia)
-        t2 = rpa.make_t2(U, tau, nocc, nvir)
-        amp = rpa._RPAAmpERIS(U.reshape(nocc,nvir,-1), tau, mlno.max_memory)
-        moeocc, moevir = mlno.split_mo_energy()[1:3]
+        J, eia, moeocc, moevir = self._full_drccd(mlno, eris)
+        nocc, nvir = moeocc.size, moevir.size
+        U = driccd.kernel_eig(J, eia).reshape(nocc,nvir,-1)
+        t2_rpa = driccd.make_t2(U, moeocc, moevir)
+        kappa = 1.1
+        oovv = np.einsum('iax,jbx->ijab', J.reshape(nocc,nvir,-1), J.reshape(nocc,nvir,-1))
+        denom = -lib.direct_sum('ia+jb->ijab', eia.reshape(nocc,nvir), eia.reshape(nocc,nvir))
+        t2_kappa = oovv / denom * (1 - np.exp(kappa*denom))
 
         rng = np.random.default_rng(1)
-        uocc = np.linalg.qr(rng.standard_normal((nocc,2)))[0]
-        uvir = np.linalg.qr(rng.standard_normal((nvir,3)))[0]
-        for occ_type, u in [('1h',uocc), ('1p',uvir), ('2p',uvir)]:
-            dm = make_lno_rdm1.make_lo_rdm1_occ(amp, moeocc, moevir, uocc, uvir, occ_type)
-            self.assertAlmostEqual(abs(dm - ref_rdm1(t2, u, 'occ'+occ_type)).max(), 0, 10)
-        for vir_type, u in [('1p',uvir), ('1h',uocc), ('2h',uocc)]:
-            dm = make_lno_rdm1.make_lo_rdm1_vir(amp, moeocc, moevir, uocc, uvir, vir_type)
-            self.assertAlmostEqual(abs(dm - ref_rdm1(t2, u, 'vir'+vir_type)).max(), 0, 10)
+        uocc = np.linalg.qr(rng.standard_normal((nocc,nocc)))[0]
+        uvir = np.linalg.qr(rng.standard_normal((nvir,nvir)))[0]
+        for amp, t2 in [(_DressedERIS(eris, ovL=U), t2_rpa),
+                        (_DressedERIS(eris, kappa=kappa), t2_kappa)]:
+            for occ_type, u in [('1h',uocc), ('1p',uvir), ('2p',uvir)]:
+                dm = make_lno_rdm1.make_lo_rdm1_occ(amp, moeocc, moevir, uocc, uvir, occ_type)
+                self.assertAlmostEqual(abs(dm - ref_rdm1(t2, u, 'occ'+occ_type)).max(), 0, 10)
+            for vir_type, u in [('1p',uvir), ('1h',uocc), ('2h',uocc)]:
+                dm = make_lno_rdm1.make_lo_rdm1_vir(amp, moeocc, moevir, uocc, uvir, vir_type)
+                self.assertAlmostEqual(abs(dm - ref_rdm1(t2, u, 'vir'+vir_type)).max(), 0, 10)
 
     def test_lno_rpa_complete_space(self):
         # Without truncation, fragment RPA/SOSEX energies sum to the full-system ones
@@ -166,17 +176,32 @@ class WaterDimerRPA(unittest.TestCase):
 
     def test_amp_settings(self):
         mlno = self._lno()
+        mo_coeff, mo_occ = self.mf.mo_coeff, self.mf.mo_occ
+        maskact = np.arange(mo_occ.size) >= self.frozen
         self.assertEqual((mlno._lno_amp, mlno._pt2_amp), ('mp2', 'mp2'))
         mlno.lno_amp = 'RPA'
         self.assertEqual((mlno._lno_amp, mlno._pt2_amp), ('rpa', 'rpa'))
+        self.assertEqual(mlno.DRPA().solver, 'eig')
+        mlno.rpa_solver = 'riccati'
+        self.assertEqual(mlno.DRPA().solver, 'riccati')
+        kwargs = mlno._pt2_impurity_kwargs(mo_coeff, mo_occ, maskact)
+        nocc = np.count_nonzero(mo_occ)
+        self.assertEqual(kwargs['ovJ'].shape[:2], (nocc-self.frozen, mo_occ.size-nocc))
         mlno.pt2_amp = 'mp2'
         self.assertEqual((mlno._lno_uses_rpa, mlno._pt2_uses_rpa), (True, False))
-        self.assertEqual(mlno._pt2_impurity_kwargs['rpa'], None)
-        mlno.lno_amp, mlno.pt2_amp = 'mp2', 'kappa-mp2'
-        self.assertEqual(mlno._pt2_impurity_kwargs['kappa'], mlno.kappa)
+        self.assertEqual(mlno._pt2_impurity_kwargs(mo_coeff, mo_occ, maskact),
+                         {'pt2_amp': 'mp2', 'kappa': mlno.kappa})
         mlno.pt2_amp = 'ccsd'
         with self.assertRaises(ValueError):
             mlno._pt2_amp
+        mlno.lno_amp, mlno.pt2_amp, mlno.prune_lno_basis = 'mp2', 'sosex', True
+        with self.assertRaises(NotImplementedError):
+            mlno._pt2_amp
+        # no RPA/SOSEX amplitudes for ULNO
+        umlno = ULNOCCSD(scf.UHF(self.mol).density_fit(), [self.lo_coeff]*2, [[[0],[]]])
+        umlno.lno_amp = 'rpa'
+        with self.assertRaises(NotImplementedError):
+            umlno._lno_amp
 
     def test_rpa_lno_mp2_energy(self):
         # RPA LNOs with the MP2 fragment energy: same active spaces as lno_amp='rpa',
@@ -206,8 +231,9 @@ class WaterDimerRPA(unittest.TestCase):
 
     def test_lno_sosex_restart(self):
         # the full-system drCCD energies are restored from the chkfile, so a restart with
-        # all LNOs saved does not solve drCCD again; the integrals are only rebuilt for the
-        # SOSEX energy of the fragment whose energies were removed
+        # all LNOs saved neither solves drCCD again nor builds the full-system integrals:
+        # the SOSEX energy of the fragment whose energies were removed only needs those of
+        # its active space
         from unittest import mock
         from pyscf.lno.test.test_lnoccsd import kernel_counted
         thresh = [1e-4, 1e-5]
@@ -217,7 +243,7 @@ class WaterDimerRPA(unittest.TestCase):
         m2.frag_eners[0] = None
         with mock.patch.object(m2, 'solve_rpa', side_effect=AssertionError('drCCD solved')):
             calls = kernel_counted(m2)
-        self.assertEqual(calls, {'ao2mo': 1, 'make_las': 0, 'impurity_solve': 1})
+        self.assertEqual(calls, {'ao2mo': 0, 'make_las': 0, 'impurity_solve': 1})
         self.assertEqual(m2.e_corr_rpa_full, m1.e_corr_rpa_full)
         self.assertEqual(m2.e_corr_sosex_full, m1.e_corr_sosex_full)
         for key in ['efrag_pt2', 'efrag_cc']:

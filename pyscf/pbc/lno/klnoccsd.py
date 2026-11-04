@@ -462,7 +462,7 @@ class KLNOCCSD(KLNO,LNOCCSD):
                               ccsd_t=self.ccsd_t, verbose_imp=self.verbose_imp,
                               max_las_size_ccsd=self._max_las_size_ccsd,
                               max_las_size_ccsd_t=self._max_las_size_ccsd_t,
-                              **self._pt2_impurity_kwargs)
+                              **self._pt2_impurity_kwargs(mo_coeff, mo_occ, maskact))
 
 class KLNOCCSD_T(KLNOCCSD):
     def __init__(self, *args, **kwargs):
