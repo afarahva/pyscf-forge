@@ -65,8 +65,18 @@ class KnownValues(unittest.TestCase):
     def test_frozen(self):
         m = regpt2.KDRICCD(kmf, frozen=1).set(solver='eig').run()
         self.assertAlmostEqual(m.e_corr, -0.020688483637, 9)
-        with self.assertRaises(NotImplementedError):
-            regpt2.KDRICCD(kmf, frozen=[[0],[0],[]]).run()
+
+    def test_uneven_kpoints(self):
+        # different numbers of active occupied orbitals per k-point (as in metals): padded
+        # orbitals decouple; reference from the dense complex RPA eigenproblem of the
+        # physical excitations, E_c = 1/2 (sum of the RPA frequencies - Tr A)
+        frozen = [[0],[0],[]]
+        m = regpt2.KDRICCD(kmf, frozen=frozen).set(solver='eig').run()
+        self.assertAlmostEqual(m.e_corr, -0.031656552033, 9)
+        self.assertAlmostEqual(m.e_corr_sosex, -0.015953490932, 9)
+        m = regpt2.KDRICCD(kmf, frozen=frozen).run()
+        self.assertTrue(m.converged)
+        self.assertAlmostEqual(m.e_corr, -0.031656552033, 7)
 
     def test_without_sosex(self):
         m = regpt2.KDRICCD(kmf).set(solver='eig', with_sosex=False)

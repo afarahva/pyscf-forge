@@ -45,6 +45,12 @@ The correlation energies per unit cell are
 
     E_dRPA  = 1/N_k sum_q sum_{PL} (U_q - conj(J_q))_{PL} J_q[P,L]
     E_SOSEX = 1/N_k sum_{ki,kj,ka} sum_{ijab} t2[i,j,a,b] [2 (ia|jb) - (ib|ja)]
+
+Metals (different numbers of occupied orbitals at different k-points) use the padded
+orbitals of `pyscf.pbc.mp.kmp2`: the padding orbitals get the energies -/+PAD_ENERGY
+(occupied/virtual) and their excitations zero integrals J, so they decouple exactly from
+the physical ones (T = 0, U = 0 there) in both solvers, and every (k_i, k_a) block keeps
+the same (nocc, nvir) shape.
 '''
 
 import numpy as np
@@ -60,6 +66,11 @@ from pyscf import __config__
 einsum = lib.einsum
 
 WITH_T2 = getattr(__config__, 'pbc_regpt2_kdriccd_with_t2', True)
+
+# |orbital energy| (Eh) of the padding orbitals of uneven k-point occupations. Their
+# excitations have zero integrals, so any positive value is exact; a moderate one keeps
+# the RPA matrices of the 'eig' solver well conditioned.
+PAD_ENERGY = getattr(__config__, 'pbc_regpt2_kdriccd_pad_energy', 1e3)
 
 
 def kernel(mycc, J, D, minus=None, verbose=None):
@@ -93,15 +104,45 @@ def get_ovJ(mycc, mo_energy):
     '''
     nocc, nkpts = mycc.nocc, mycc.nkpts
     kconserv = mycc.khelper.kconserv
+    occ_mask, vir_mask = _padding_masks(mycc)
     Lov = kmp2._init_mp_df_eris(mycc)
     J, D = [], []
     for kq in range(nkpts):
         kas = [kconserv[ki,0,kq] for ki in range(nkpts)]
-        J.append(np.vstack([Lov[ki,ka].reshape(Lov[ki,ka].shape[0],-1).T
+        # zero integrals for the excitations of padding orbitals (see the module docstring)
+        J.append(np.vstack([Lov[ki,ka].reshape(Lov[ki,ka].shape[0],-1).T *
+                            (occ_mask[ki][:,None] & vir_mask[ka]).reshape(-1,1)
                             for ki, ka in enumerate(kas)]) / np.sqrt(nkpts))
         D.append(np.concatenate([(mo_energy[ka][nocc:] - mo_energy[ki][:nocc,None]).ravel()
                                  for ki, ka in enumerate(kas)]))
     return J, D
+
+def _padding_masks(mycc):
+    r''' Per k-point, the occupied and virtual slots of the padded orbitals that hold a
+    physical orbital (True) rather than padding (False).
+    '''
+    nocc, nvir = mycc.nocc, mycc.nmo - mycc.nocc
+    occ_idx, vir_idx = kmp2.padding_k_idx(mycc, kind='split')
+    occ_mask = np.zeros((mycc.nkpts,nocc), dtype=bool)
+    vir_mask = np.zeros((mycc.nkpts,nvir), dtype=bool)
+    for k in range(mycc.nkpts):
+        occ_mask[k,occ_idx[k]] = True
+        vir_mask[k,vir_idx[k]] = True
+    return occ_mask, vir_mask
+
+def _pad_mo_energy(mycc, mo_energy):
+    r''' The padded orbital energies with -PAD_ENERGY (occupied) and +PAD_ENERGY (virtual)
+    at the padding slots, so that their excitation energies are large and positive.
+    '''
+    nocc = mycc.nocc
+    occ_mask, vir_mask = _padding_masks(mycc)
+    out = []
+    for e, mo, mv in zip(mo_energy, occ_mask, vir_mask):
+        e = np.asarray(e, dtype=float).copy()
+        e[:nocc][~mo] = -PAD_ENERGY
+        e[nocc:][~mv] = PAD_ENERGY
+        out.append(e)
+    return out
 
 def kernel_riccati(J, D, minus, cd_thresh=1e-6, max_cycle=100, conv_tol=1e-8,
                    conv_tol_normu=1e-6, diis_space=8, damp=0., verbose=None, log=None):
@@ -286,10 +327,8 @@ class KDRICCD(kmp2.KMP2):
     kernel = KKappaMP2.kernel
 
     def init_amps(self, mo_energy, mo_coeff, with_t2=WITH_T2):
-        if (np.any(self.get_nocc(per_kpoint=True) != self.nocc) or
-                np.any(self.get_nmo(per_kpoint=True) != self.nmo)):
-            raise NotImplementedError('k-point drCCD needs the same number of occupied and '
-                                      'virtual orbitals at every k-point.')
+        # uneven occupations (metals): padding orbitals decouple, see the module docstring
+        mo_energy = _pad_mo_energy(self, mo_energy)
         J, D = get_ovJ(self, mo_energy)
         self.converged, self.U = kernel(self, J, D)
         e_corr = energy(self.U, J, self.nkpts)
