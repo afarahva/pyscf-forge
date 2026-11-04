@@ -956,13 +956,14 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
         as `make_lo_rdm1_occ_1h_real` and `make_lo_rdm1_vir_1h_real`, with j, a, c Bloch
         orbitals and I = \sum_{ki} |k i> C(k i,I) the semicanonical fragment orbitals.
         Momentum conservation fixes k_I = k_a - k_j + k_c, so each block of (Ia|jc) needs
-        the integrals Lov[kI,ka] and Lov[kj,kc] of one momentum transfer q = k_a - k_I.
+        the integrals of one momentum transfer q = k_a - k_I = k_j - k_c only.
 
-        The amplitudes are made for a block of I and one k_c at a time, as the slabs
-            A(Ijac) = t2(Ijac),  B(Ijca) = t2(Ijca)     (c in k_c; j, a in all k)
-        which hold every amplitude the density matrices need for c in k_c. Each amplitude
-        is thus made twice (in the slab of k_c and in that of k_a), but no amplitude array
-        is larger than (nI, Nk*nocc, Nk*nvir, nvir).
+        Both density matrices are sums over c, so the amplitudes are made for a block of I
+        and one k_c at a time, as the slabs
+            t_ac = t2(I j a c),  t_ca = t2(I j c a)     (c in k_c; j, a in all k)
+        which hold every amplitude the density matrices need for those c. Each amplitude is
+        thus made twice (in t_ac of k_c and in t_ca of k_a), but no amplitude array is
+        larger than (nI, Nk*nocc, Nk*nvir, nvir).
 
         Args:
             eris : _KLNODFKERIS
@@ -989,10 +990,9 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
     eI, cI = subspace_eigh(np.diag(eo.ravel()), np.dot(eris.Wocc, u))
     cI = cI.reshape(nkpts,nocc,-1)
     nOcc = eI.size
-    evall = ev.ravel()
 
-    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (A, B, temporaries);
-    # fixed, the density matrices and the integrals regrouped by q (Lq)
+    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (t_ac, t_ca,
+    # temporaries); fixed, the density matrices and jaL
     mem_avail = eris.max_memory - lib.current_memory()[0]
     mem_fix = (nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
     mem_I = (nkpts*naux*nkv + 6*nko*nkv*nvir) * dsize/1e6
@@ -1002,59 +1002,46 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
                   'naux = %d  Occblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nOcc,
                   naux, Occblksize, mem_fix + Occblksize*mem_I)
 
-    # Lq[q] = (j a|L) of all k_j, with k_a = k_j - q: (naux_q, Nk*nocc*nvir)
+    # jaL[q] = (j a|L) of all k_j, with k_a = k_j - q: (naux_q, Nk, nocc, nvir)
     kjs = np.arange(nkpts)
-    Lq = [np.hstack([Lov[kj,kconserv[kj,q,0]].reshape(-1,nocc*nvir) for kj in kjs])
-          for q in range(nkpts)]
+    jaL = [np.stack([Lov[kj,kconserv[kj,q,0]] for kj in kjs], axis=1) for q in range(nkpts)]
 
     dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
     dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
+    eov, evv = eo.ravel(), ev.ravel()
     for I0,I1 in lib.prange(0,nOcc,Occblksize):
         nI = I1 - I0
         eIv = eI[I0:I1]
-        # IvL[q][:,ka] = (I a|L), a in k_a, of momentum q = k_a - k_I: (naux_q, Nk, nI, nvir)
-        IvL = []
-        for q in range(nkpts):
-            Iv = np.empty((Lov[kconserv[0,q,0],0].shape[0],nkpts,nI,nvir), dtype=COMPLEX)
-            for ka in range(nkpts):
-                ki = kconserv[ka,q,0]
-                Iv[:,ka] = lib.einsum('Lia,iI->LIa', Lov[ki,ka], cI[ki,:,I0:I1].conj())
-            IvL.append(Iv)
-        A = np.empty((nI,nkpts,nocc,nkpts,nvir,nvir), dtype=COMPLEX)
-        B = np.empty((nI,nkpts,nocc,nvir,nkpts,nvir), dtype=COMPLEX)
+        # IaL[q] = (I a|L) of all k_a, with k_I = k_a - q: (naux_q, Nk, nI, nvir)
+        IaL = [np.stack([lib.einsum('Lia,iI->LIa', Lov[kconserv[ka,q,0],ka],
+                                    cI[kconserv[ka,q,0],:,I0:I1].conj())
+                         for ka in range(nkpts)], axis=1) for q in range(nkpts)]
+        t_ac = np.empty((nI,nkpts,nocc,nkpts,nvir,nvir), dtype=COMPLEX)
+        t_ca = np.empty((nI,nkpts,nocc,nvir,nkpts,nvir), dtype=COMPLEX)
         for kc in range(nkpts):
-            # (I c|L) of c in k_c for each q
-            IcL = [np.asarray(Iv[:,kc], order='C').reshape(Iv.shape[0],-1) for Iv in IvL]
-            # A: (I a|j c), a in all k, with q = k_j - k_c: one product per k_j
+            # (I a|j c): q = k_j - k_c, one product per k_j for all k_a
             for kj in range(nkpts):
-                Iv = IvL[kconserv[kj,kc,0]]
-                num = lib.dot(Iv.reshape(Iv.shape[0],-1).T, Lov[kj,kc].reshape(-1,nocc*nvir))
-                A[:,kj] = num.reshape(nkpts,nI,nvir,nocc,nvir).transpose(1,3,0,2,4)
-            # B: (I c|j a) with q = k_j - k_a: one product per q, for all k_j (k_a = k_j - q)
+                t_ac[:,kj] = lib.einsum('LkIa,Ljc->Ijkac', IaL[kconserv[kj,kc,0]], Lov[kj,kc])
+            # (I c|j a): q = k_j - k_a, one product per q for all k_j (and k_a = k_j - q)
             for q in range(nkpts):
-                num = lib.dot(IcL[q].T, Lq[q]).reshape(nI,nvir,nkpts,nocc,nvir)
-                B[:,kjs,:,:,kconserv[kjs,q,0]] = num.transpose(2,0,3,1,4)
-            num = Iv = None
-            for kj in range(nkpts):
-                # amplitudes in place (A[:,kj] and B[:,kj] are views)
-                denom = lib.direct_sum('I+j-a-c->Ijac', eIv, eo[kj], evall, ev[kc])
-                _make_t2(eris, A[:,kj], denom.reshape(A.shape[:1]+A.shape[2:]))
-                denom = lib.direct_sum('I+j-c-a->Ijca', eIv, eo[kj], ev[kc], evall)
-                _make_t2(eris, B[:,kj], denom.reshape(B.shape[:1]+B.shape[2:]))
-                denom = None
-            a = A.reshape(nI,nko,nkv,nvir)
-            b = B.reshape(nI,nko,nvir,nkv)
+                t_ca[:,kjs,:,:,kconserv[kjs,q,0]] = lib.einsum('LIc,Lkja->kIjca',
+                                                               IaL[q][:,kc], jaL[q])
+            # amplitudes in place
+            tac = _make_t2(eris, t_ac.reshape(nI,nko,nkv,nvir),
+                           lib.direct_sum('I+j-a-c->Ijac', eIv, eov, evv, ev[kc]))
+            tca = _make_t2(eris, t_ca.reshape(nI,nko,nvir,nkv),
+                           lib.direct_sum('I+j-c-a->Ijca', eIv, eov, ev[kc], evv))
             if with_vir:
-                X = (2*a - b.transpose(0,1,3,2)).conj()
-                dmvv += lib.einsum('Ijac,Ijbc->ab', a, X)
-                X = (2*b - a.transpose(0,1,3,2)).conj()
-                dmvv += lib.einsum('Ijca,Ijcb->ab', b, X)
+                x = 2*tac - tca.transpose(0,1,3,2)
+                dmvv += lib.einsum('Ijac,Ijbc->ab', tac, x.conj())
+                x = 2*tca - tac.transpose(0,1,3,2)
+                dmvv += lib.einsum('Ijca,Ijcb->ab', tca, x.conj())
             if with_occ:
-                X = 2*b.transpose(0,1,3,2) - 4*a
-                dmoo += lib.einsum('Kiac,Kjac->ij', a.conj(), X)
-            X = a = b = IcL = None
-        A = B = IvL = None
-    Lq = None
+                x = 2*tca.transpose(0,1,3,2) - 4*tac
+                dmoo += lib.einsum('Kiac,Kjac->ij', tac.conj(), x)
+            x = tac = tca = None
+        t_ac = t_ca = IaL = None
+    jaL = None
 
     # Bloch -> supercell canonical orbitals
     if with_occ:
