@@ -40,8 +40,10 @@ from pyscf.pbc.df.df import _load3c
 from pyscf import __config__
 
 from pyscf.lno import LNO, drpa
-from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh
-from pyscf.pbc.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
+from pyscf.pbc.lib.kpts_helper import get_kconserv
+from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh, s2k_mo_coeff
+from pyscf.pbc.lno.make_lno_rdm1 import (make_lo_rdm1_occ, make_lo_rdm1_vir,
+                                         make_lo_rdm1_1h_occ_k, make_lo_rdm1_1h_vir_k)
 
 einsum = lib.einsum
 
@@ -73,6 +75,12 @@ class KLNO(LNO):
             occ and vir separately. Default is [1e-5,1e-6].
         frozen (int or list):
             Same as the `frozen` attr in MP2/CCSD etc. modules.
+        k_eris (bool):
+            Build the LNO density matrices from the k-point DF integrals of the Bloch
+            orbitals (`make_lno_rdm1.make_lo_rdm1_1h_k`) instead of the supercell-layout
+            integrals: ~Nk/2 times less memory. Used for '1h'/'1h' MP2 and kappa-MP2 LNOs
+            with in-core integrals and active orbitals made of whole bands (the same number
+            per k-point); otherwise the supercell integrals are used. Default is True.
     '''
 
     def __init__(self, kmf, lo_coeff, frag_lolist, lno_type=None, lno_thresh=None, frozen=None,
@@ -84,9 +92,20 @@ class KLNO(LNO):
         self.with_df = kmf.with_df
         self.unit_cell = kmf.cell
         self.kpts = kmf.kpts
+        self.k_eris = True
+
+    def dump_flags(self, verbose=None):
+        super().dump_flags(verbose)
+        logger.info(self, 'k_eris = %s', self.k_eris)
+        return self
 
     def ao2mo(self):
         log = logger.new_logger(self)
+
+        if self.k_eris:
+            eris = self.ao2mo_k()
+            if eris is not None:
+                return eris
 
         if self.with_df is None:
             log.error('DF is not found. Rerun KSCF with DF.')
@@ -123,6 +142,44 @@ class KLNO(LNO):
 
             return eris
 
+    def ao2mo_k(self):
+        r''' k-point DF integrals of the active Bloch orbitals for the LNO density matrices
+        (see `k_eris`), or None where they do not apply.
+        '''
+        log = logger.new_logger(self)
+        if self._lno_uses_rpa:
+            reason = 'lno_amp = %s' % self._lno_amp
+        elif list(self.lno_type) != ['1h','1h']:
+            reason = 'lno_type = %s' % self.lno_type
+        elif (self._ovL is not None or self._ovL_to_save is not None or
+              self.force_outcore_ao2mo or self.with_df is None):
+            reason = 'outcore or no DF integrals'
+        else:
+            orbocc, orbvir = self.split_mo_coeff()[1:3]
+            occ = _bloch_orbitals(self._kscf, orbocc)
+            vir = _bloch_orbitals(self._kscf, orbvir)
+            if occ is None or vir is None:
+                reason = 'active orbitals are not whole bands with the same number per k-point'
+            else:
+                nkpts, nocc = occ[0].shape
+                nvir = vir[0].shape[1]
+                mem_df = nkpts**2*nocc*nvir*self.with_df.get_naoaux() * 16/1e6
+                mem_now = self.max_memory - lib.current_memory()[0]
+                log.debug('ao2mo_k est mem= %.2f MB  avail mem= %.2f MB', mem_df, mem_now)
+                reason = None
+                if mem_df > min(mem_now*0.75, mem_now-2000):
+                    reason = 'not enough memory'
+        if reason is not None:
+            log.info('k_eris: supercell integrals are used (%s)', reason)
+            return None
+
+        cput0 = (logger.process_clock(), logger.perf_counter())
+        eris = _KLNODFKERIS(self.with_df, orbocc, orbvir, occ, vir, self.max_memory,
+                            verbose=self.verbose, stdout=self.stdout)
+        eris.build()
+        log.timer('Integral xform   ', *cput0)
+        return eris
+
     @property
     def _e_full_scale(self):
         r''' Full-system (supercell) energies are reported per unit cell, matching the
@@ -141,6 +198,8 @@ class KLNO(LNO):
 
     # The dressed integrals of RPA/SOSEX are real and in core: molecular rdm1 code
     def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
+        if isinstance(eris, _KLNODFKERIS):
+            return make_lo_rdm1_1h_occ_k(self._lno_amp_eris(eris), uocc_loc)
         if self._lno_uses_rpa:
             return LNO.make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         occ_lno_type)
@@ -148,11 +207,98 @@ class KLNO(LNO):
                                 uvir_loc, occ_lno_type)
 
     def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
+        if isinstance(eris, _KLNODFKERIS):
+            return make_lo_rdm1_1h_vir_k(self._lno_amp_eris(eris), uocc_loc)
         if self._lno_uses_rpa:
             return LNO.make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
                                         vir_lno_type)
         return make_lo_rdm1_vir(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
                                 uvir_loc, vir_lno_type)
+
+
+def _bloch_orbitals(kmf, orb, tol=1e-6):
+    r''' The Bloch orbitals of `kmf` spanning the supercell orbitals `orb` (supercell AO
+    coefficients) and their overlap with them.
+
+    Returns:
+        mo_energy (Nk,n), mo_coeff (Nk,nao,n), W (Nk*n, norb) with W(k p,I) = <k p|I>;
+        or None if `orb` is not made of whole bands with the same number n per k-point.
+    '''
+    korb = s2k_mo_coeff(kmf.cell, kmf.kpts, orb)
+    moe, mo, W = [], [], []
+    for k, s1e in enumerate(kmf.get_ovlp()):
+        w = np.linalg.multi_dot((kmf.mo_coeff[k].T.conj(), s1e, korb[k]))
+        wt = lib.einsum('pI,pI->p', w.conj(), w).real
+        if abs(wt*(1-wt)).max() > tol:
+            return None
+        idx = wt > 0.5
+        moe.append(kmf.mo_energy[k][idx])
+        mo.append(kmf.mo_coeff[k][:,idx])
+        W.append(w[idx])
+    if len(set(len(e) for e in moe)) != 1 or sum(len(e) for e in moe) != orb.shape[1]:
+        return None
+    return np.asarray(moe), np.asarray(mo), np.vstack(W)
+
+
+class _KLNODFKERIS(lib.StreamObject):
+    r''' k-point DF integrals of the active Bloch orbitals, for the LNO density matrices
+    (`make_lno_rdm1.make_lo_rdm1_1h_k`)
+
+        Lov[ki,ka][L,i,a] = (ki i, ka a|L) / sqrt(Nk),   (ia|jb) = \sum_L Lov[ki,ka] Lov[kj,kb]
+
+    with the Bloch orbital energies `mo_energy_occ`/`mo_energy_vir` (Nk,nocc)/(Nk,nvir) and
+    the overlaps `Wocc`/`Wvir` (W(k p,I) = <k p|I>) of the Bloch and the supercell
+    canonical orbitals `orbocc`/`orbvir`.
+    '''
+    def __init__(self, with_df, orbocc, orbvir, occ, vir, max_memory, verbose=None,
+                 stdout=None):
+        self.with_df = with_df
+        self.orbocc = orbocc
+        self.orbvir = orbvir
+        self.mo_energy_occ, self.mo_coeff_occ, self.Wocc = occ
+        self.mo_energy_vir, self.mo_coeff_vir, self.Wvir = vir
+        self.kconserv = get_kconserv(with_df.cell, with_df.kpts)
+
+        self.max_memory = max_memory
+        self.verbose = verbose
+        self.stdout = stdout
+
+        self.dtype = np.complex128
+        self.dsize = 16
+        if np.isrealobj(orbocc) and np.isrealobj(orbvir):
+            self.dtype_eri = np.float64
+        else:
+            self.dtype_eri = np.complex128
+        self.Lov = None
+
+    @property
+    def nocc(self):
+        return self.orbocc.shape[1]
+    @property
+    def nvir(self):
+        return self.orbvir.shape[1]
+
+    def build(self):
+        from pyscf.ao2mo import _ao2mo
+        from pyscf.pbc.df.df import CDERIArray
+        with_df = self.with_df
+        if with_df._cderi is None:
+            with_df.build()
+        nkpts, nocc = self.mo_energy_occ.shape
+        nvir = self.mo_energy_vir.shape[1]
+        nao = with_df.cell.nao_nr()
+        self.Lov = np.empty((nkpts,nkpts), dtype=object)
+        with CDERIArray(with_df._cderi) as cderi:
+            for ki in range(nkpts):
+                for ka in range(nkpts):
+                    Lpq = cderi[ki,ka]
+                    if Lpq[0].size != nao**2:  # aosym = 's2'
+                        Lpq = lib.unpack_tril(Lpq).astype(np.complex128)
+                    mo = np.asarray(np.hstack((self.mo_coeff_occ[ki], self.mo_coeff_vir[ka])),
+                                    dtype=np.complex128, order='F')
+                    out = _ao2mo.r_e2(Lpq, mo, (0,nocc,nocc,nocc+nvir), [], None)
+                    self.Lov[ki,ka] = out.reshape(-1,nocc,nvir) / nkpts**0.5
+        return self
 
 
 def _KLNODFINCOREERIS(with_df, orbocc, orbvir, max_memory, verbose=None, stdout=None):

@@ -26,7 +26,7 @@ from pyscf.mp.ump2 import get_frozen_mask
 from pyscf.lno.ulno import ULNO
 from pyscf.lno import lnoccsd
 from pyscf.lno.lnoccsd import LNOCCSD, LNOCCSD_T
-from pyscf.regmp.kappamp2 import kappa_factor
+from pyscf.regpt2.kappamp2 import kappa_factor
 from pyscf.lno.lno import PT2_LABELS
 
 einsum = lib.einsum

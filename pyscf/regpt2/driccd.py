@@ -61,7 +61,7 @@ from pyscf import __config__
 
 einsum = lib.einsum
 
-WITH_T2 = getattr(__config__, 'regmp_driccd_with_t2', True)
+WITH_T2 = getattr(__config__, 'regpt2_driccd_with_t2', True)
 
 
 def kernel(mycc, J, eo, ev, verbose=None):
@@ -257,14 +257,14 @@ class DRICCD(dfmp2.DFRMP2):
         t2 : amplitudes (if with_t2)
     '''
 
-    solver = getattr(__config__, 'regmp_driccd_DRICCD_solver', 'riccati')
-    with_sosex = getattr(__config__, 'regmp_driccd_DRICCD_with_sosex', True)
-    cd_thresh = getattr(__config__, 'regmp_driccd_DRICCD_cd_thresh', 1e-6)
-    max_cycle = getattr(__config__, 'regmp_driccd_DRICCD_max_cycle', 100)
-    conv_tol = getattr(__config__, 'regmp_driccd_DRICCD_conv_tol', 1e-8)
-    conv_tol_normu = getattr(__config__, 'regmp_driccd_DRICCD_conv_tol_normu', 1e-6)
-    diis_space = getattr(__config__, 'regmp_driccd_DRICCD_diis_space', 8)
-    damp = getattr(__config__, 'regmp_driccd_DRICCD_damp', 0.)
+    solver = getattr(__config__, 'regpt2_driccd_DRICCD_solver', 'riccati')
+    with_sosex = getattr(__config__, 'regpt2_driccd_DRICCD_with_sosex', True)
+    cd_thresh = getattr(__config__, 'regpt2_driccd_DRICCD_cd_thresh', 1e-6)
+    max_cycle = getattr(__config__, 'regpt2_driccd_DRICCD_max_cycle', 100)
+    conv_tol = getattr(__config__, 'regpt2_driccd_DRICCD_conv_tol', 1e-8)
+    conv_tol_normu = getattr(__config__, 'regpt2_driccd_DRICCD_conv_tol_normu', 1e-6)
+    diis_space = getattr(__config__, 'regpt2_driccd_DRICCD_diis_space', 8)
+    damp = getattr(__config__, 'regpt2_driccd_DRICCD_damp', 0.)
 
     _keys = {'converged', 'e_corr_sosex', 'U'}
 

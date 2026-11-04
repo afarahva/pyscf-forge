@@ -35,7 +35,7 @@ import numpy as np
 
 from pyscf import lib
 from pyscf.lib import logger
-from pyscf.lno.make_lno_rdm1 import _mp2_rdm1_occblksize, subspace_eigh, _regularize, DEBUG_BLKSIZE
+from pyscf.lno.make_lno_rdm1 import _mp2_rdm1_occblksize, subspace_eigh, _make_t2, DEBUG_BLKSIZE
 
 
 def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
@@ -142,8 +142,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
             # form t2_ovov-block
             denom_aa = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_a)
-            t2aa_i = eris.get_ivov(u_a, K0, K1, i0, i1) / denom_aa
-            t2aa_i = _regularize(eris, t2aa_i, denom_aa)
+            t2aa_i = _make_t2(eris, eris.get_ivov(u_a, K0, K1, i0, i1), denom_aa, conj=False)
             t2aa_i = t2aa_i - t2aa_i.transpose(0, 3, 2, 1)
             denom_aa = None
             eiv_a = None
@@ -157,8 +156,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
                     # form t2_ovov-block
                     denom_aa = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_a)
-                    t2aa_j = eris.get_ivov(u_a, K0, K1, j0, j1) / denom_aa
-                    t2aa_j = _regularize(eris, t2aa_j, denom_aa)
+                    t2aa_j = _make_t2(eris, eris.get_ivov(u_a, K0, K1, j0, j1), denom_aa, conj=False)
                     t2aa_j = t2aa_j - t2aa_j.transpose(0, 3, 2, 1)
                     denom_aa = None
                     ejv_a = None
@@ -185,8 +183,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
             # form t2_ovov-block
             denom_bb = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_b)
-            t2bb_i = eris.get_IVOV(u_b, K0, K1, i0, i1) / denom_bb
-            t2bb_i = _regularize(eris, t2bb_i, denom_bb)
+            t2bb_i = _make_t2(eris, eris.get_IVOV(u_b, K0, K1, i0, i1), denom_bb, conj=False)
             t2bb_i = t2bb_i - t2bb_i.transpose(0, 3, 2, 1)
             denom_bb = None
             eiv_b = None
@@ -200,8 +197,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
                     # form t2_ovov-block
                     denom_bb = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_b)
-                    t2bb_j = eris.get_IVOV(u_b, K0, K1, j0, j1) / denom_bb
-                    t2bb_j = _regularize(eris, t2bb_j, denom_bb)
+                    t2bb_j = _make_t2(eris, eris.get_IVOV(u_b, K0, K1, j0, j1), denom_bb, conj=False)
                     t2bb_j = t2bb_j - t2bb_j.transpose(0, 3, 2, 1)
                     denom_bb = None
                     ejv_b = None
@@ -227,8 +223,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
             # form t2_ovov-block
             denom_ba = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_a)
-            t2ba_i = eris.get_IVov(u_b, K0, K1, i0, i1) / denom_ba
-            t2ba_i = _regularize(eris, t2ba_i, denom_ba)
+            t2ba_i = _make_t2(eris, eris.get_IVov(u_b, K0, K1, i0, i1), denom_ba, conj=False)
             denom_ba = None
             eiv_a = None
 
@@ -241,8 +236,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
                     # form t2_ovov-block
                     denom_ba = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_a)
-                    t2ba_j = eris.get_IVov(u_b, K0, K1, j0, j1) / denom_ba
-                    t2ba_j = _regularize(eris, t2ba_j, denom_ba)
+                    t2ba_j = _make_t2(eris, eris.get_IVov(u_b, K0, K1, j0, j1), denom_ba, conj=False)
                     denom_ba = None
                     ejv_a = None
 
@@ -268,8 +262,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
             # form t2_ovov-block
             denom_ab = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_b)
-            t2ab_i = eris.get_ivOV(u_a, K0, K1, i0, i1) / denom_ab
-            t2ab_i = _regularize(eris, t2ab_i, denom_ab)
+            t2ab_i = _make_t2(eris, eris.get_ivOV(u_a, K0, K1, i0, i1), denom_ab, conj=False)
             denom_ba = None
             eiv_b = None
 
@@ -282,8 +275,7 @@ def make_lo_rdm1_1h(eris, moeocc, moevir, uocc):
 
                     # form t2_ovov-block
                     denom_ab = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_b)
-                    t2ab_j = eris.get_ivOV(u_a, K0, K1, j0, j1) / denom_ab
-                    t2ab_j = _regularize(eris, t2ab_j, denom_ab)
+                    t2ab_j = _make_t2(eris, eris.get_ivOV(u_a, K0, K1, j0, j1), denom_ab, conj=False)
                     denom_ba = None
                     ejv_b = None
 
@@ -410,8 +402,7 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
             # form t2-block
             denom_aa = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_a)
-            t2aa_i = lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_a) / denom_aa
-            t2aa_i = _regularize(eris, t2aa_i, denom_aa)
+            t2aa_i = _make_t2(eris, lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_a), denom_aa, conj=False)
             t2aa_i = t2aa_i - t2aa_i.transpose(0, 3, 2, 1)
             denom_aa = None
             ivL_a = None
@@ -427,9 +418,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
                     # form t2-block
                     denom_aa = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_a)
-                    t2aa_j = lib.einsum(
-                        'Kax,jbx->Kajb', KvL_a, jvL_a) / denom_aa
-                    t2aa_j = _regularize(eris, t2aa_j, denom_aa)
+                    t2aa_j = _make_t2(eris, lib.einsum(
+                        'Kax,jbx->Kajb', KvL_a, jvL_a), denom_aa, conj=False)
                     t2aa_j = t2aa_j - t2aa_j.transpose(0, 3, 2, 1)
                     denom_aa = None
                     jvL_a = None
@@ -460,8 +450,7 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
             # form t2-block
             denom_bb = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_b)
-            t2bb_i = lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_b) / denom_bb
-            t2bb_i = _regularize(eris, t2bb_i, denom_bb)
+            t2bb_i = _make_t2(eris, lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_b), denom_bb, conj=False)
             t2bb_i = t2bb_i - t2bb_i.transpose(0, 3, 2, 1)
             denom_bb = None
             ivL_b = None
@@ -477,9 +466,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
                     # form t2-block
                     denom_bb = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_b)
-                    t2bb_j = lib.einsum(
-                        'Kax,jbx->Kajb', KvL_b, jvL_b) / denom_bb
-                    t2bb_j = _regularize(eris, t2bb_j, denom_bb)
+                    t2bb_j = _make_t2(eris, lib.einsum(
+                        'Kax,jbx->Kajb', KvL_b, jvL_b), denom_bb, conj=False)
                     t2bb_j = t2bb_j - t2bb_j.transpose(0, 3, 2, 1)
                     denom_bb = None
                     jvL_b = None
@@ -510,8 +498,7 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
             # form t2-block
             denom_ba = lib.direct_sum('Ka+ib->Kaib', eKv_b, eiv_a)
-            t2ba_i = lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_a) / denom_ba
-            t2ba_i = _regularize(eris, t2ba_i, denom_ba)
+            t2ba_i = _make_t2(eris, lib.einsum('Kax,ibx->Kaib', KvL_b, ivL_a), denom_ba, conj=False)
             ivL_a = None
             eiv_a = None
             denom_ba = None
@@ -527,9 +514,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
                     # form t2-block
                     denom_ba = lib.direct_sum('Ka+jb->Kajb', eKv_b, ejv_a)
-                    t2ba_j = lib.einsum(
-                        'Kax,jbx->Kajb', KvL_b, jvL_a) / denom_ba
-                    t2ba_j = _regularize(eris, t2ba_j, denom_ba)
+                    t2ba_j = _make_t2(eris, lib.einsum(
+                        'Kax,jbx->Kajb', KvL_b, jvL_a), denom_ba, conj=False)
                     jvL_a = None
                     ejv_a = None
                     denom_ba = None
@@ -560,8 +546,7 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
             # form t2-block
             denom_ab = lib.direct_sum('Ka+ib->Kaib', eKv_a, eiv_b)
-            t2ab_i = lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_b) / denom_ab
-            t2ab_i = _regularize(eris, t2ab_i, denom_ab)
+            t2ab_i = _make_t2(eris, lib.einsum('Kax,ibx->Kaib', KvL_a, ivL_b), denom_ab, conj=False)
             ivL_b = None
             eiv_b = None
             denom_ba = None
@@ -576,9 +561,8 @@ def make_lo_rdm1_1h_df(eris, moeocc, moevir, uocc):
 
                     # form t2-block
                     denom_ab = lib.direct_sum('Ka+jb->Kajb', eKv_a, ejv_b)
-                    t2ab_j = lib.einsum(
-                        'Kax,jbx->Kajb', KvL_a, jvL_b) / denom_ab
-                    t2ab_j = _regularize(eris, t2ab_j, denom_ab)
+                    t2ab_j = _make_t2(eris, lib.einsum(
+                        'Kax,jbx->Kajb', KvL_a, jvL_b), denom_ab, conj=False)
                     jvL_b = None
                     ejv_b = None
                     denom_ba = None

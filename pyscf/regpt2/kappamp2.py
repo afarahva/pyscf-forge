@@ -42,8 +42,8 @@ from pyscf.lib import logger
 from pyscf.mp import mp2, ump2, dfmp2, dfump2
 from pyscf import __config__
 
-WITH_T2 = getattr(__config__, 'regmp_kappamp2_with_t2', True)
-KAPPA = getattr(__config__, 'regmp_kappamp2_kappa', 1.1)
+WITH_T2 = getattr(__config__, 'regpt2_kappamp2_with_t2', True)
+KAPPA = getattr(__config__, 'regpt2_kappamp2_kappa', 1.1)
 
 
 def kappa_factor(denom, kappa):

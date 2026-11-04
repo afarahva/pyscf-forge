@@ -14,14 +14,13 @@
 #
 
 '''
-Regularized and renormalized second-order correlation methods (canonical orbitals)
+Regularized and renormalized second-order correlation methods with k-point sampling
+(canonical orbitals, energies per unit cell)
 
-    BWS2     : size-consistent Brillouin-Wigner PT2, BW-s2(alpha) (RHF, DF)
-    KappaMP2 : kappa-regularized MP2 (RHF/UHF, conventional or DF)
-    DRICCD   : direct ring CCD / direct RPA, with SOSEX (RHF, DF)
+    KKappaMP2 : kappa-regularized MP2 (KRHF)
+    KDRICCD   : direct ring CCD / direct RPA, with SOSEX (KRHF, GDF)
 '''
 
-from pyscf.regmp import bws2, kappamp2, driccd
-from pyscf.regmp.bws2 import BWS2
-from pyscf.regmp.kappamp2 import KappaMP2, KappaRMP2, KappaUMP2, KappaDFRMP2, KappaDFUMP2
-from pyscf.regmp.driccd import DRICCD
+from pyscf.pbc.regpt2 import kkappamp2, kdriccd
+from pyscf.pbc.regpt2.kkappamp2 import KKappaMP2
+from pyscf.pbc.regpt2.kdriccd import KDRICCD

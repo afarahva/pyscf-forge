@@ -54,7 +54,7 @@ from pyscf import __config__
 
 einsum = lib.einsum
 
-WITH_T2 = getattr(__config__, 'regmp_bws2_with_t2', True)
+WITH_T2 = getattr(__config__, 'regpt2_bws2_with_t2', True)
 
 
 def energy_and_W(JW, eoW, ev, max_memory=2000):
@@ -156,9 +156,9 @@ class BWS2(dfmp2.DFRMP2):
         t2 : amplitudes in the canonical basis (if with_t2)
     '''
 
-    alpha = getattr(__config__, 'regmp_bws2_BWS2_alpha', 1.)
-    max_cycle = getattr(__config__, 'regmp_bws2_BWS2_max_cycle', 50)
-    conv_tol = getattr(__config__, 'regmp_bws2_BWS2_conv_tol', 1e-8)
+    alpha = getattr(__config__, 'regpt2_bws2_BWS2_alpha', 1.)
+    max_cycle = getattr(__config__, 'regpt2_bws2_BWS2_max_cycle', 50)
+    conv_tol = getattr(__config__, 'regpt2_bws2_BWS2_conv_tol', 1e-8)
 
     _keys = {'converged', 'moe_occ_dressed', 'u_occ_dressed'}
 

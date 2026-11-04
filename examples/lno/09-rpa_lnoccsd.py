@@ -18,7 +18,7 @@ MP2 energy:
 
     E_corr(LNO-CCSD + dRPA) = mlno.e_corr_ccsd_pt2corrected(mlno.e_corr_rpa_full)
 
-(the same energies as the canonical `pyscf.regmp.DRICCD`).
+(the same energies as the canonical `pyscf.regpt2.DRICCD`).
 
 For periodic systems, use KLNOCCSD with real orbitals (Gamma point or time-reversal
 symmetric k-meshes); see examples 03 and 08 for the setup.

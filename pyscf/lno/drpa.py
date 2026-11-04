@@ -18,7 +18,7 @@
 
 r''' Direct ring CCD (direct RPA) amplitudes for LNO (closed shell, real orbitals)
 
-The canonical drCCD of `pyscf.regmp.driccd`, applied to given DF integrals and orbital
+The canonical drCCD of `pyscf.regpt2.driccd`, applied to given DF integrals and orbital
 energies rather than to an SCF object:
 
     full system : the dressed integrals U = (1 + 2T) J, whose MP2 amplitudes are the drCCD
@@ -35,7 +35,7 @@ import numpy as np
 
 from pyscf import lib
 from pyscf.lib import logger
-from pyscf.regmp import driccd
+from pyscf.regpt2 import driccd
 from pyscf import __config__
 
 einsum = lib.einsum
@@ -51,7 +51,7 @@ class DRPA(lib.StreamObject):
             Whether `kernel` also computes the SOSEX energy. Default is True.
 
     The remaining settings ('riccati' solver) are the defaults of
-    `pyscf.regmp.driccd.DRICCD`.
+    `pyscf.regpt2.driccd.DRICCD`.
 
     Saved results:
         e_corr, e_corr_sosex, converged

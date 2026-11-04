@@ -42,21 +42,18 @@ from functools import reduce
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import __config__
-from pyscf.regmp.kappamp2 import kappa_factor
+from pyscf.regpt2.kappamp2 import kappa_factor
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_DEBUG_BLKSIZE', False)
 
 
-def _make_t2(eris, num, denom):
-    r''' MP2 amplitudes conj(num)/denom of the integrals num = (ia|jb), damped for
-    kappa-MP2 (see `_regularize`).
+def _make_t2(eris, num, denom, conj=True):
+    r''' MP2 amplitudes conj(num)/denom (num/denom if not `conj`) of the integrals
+    num = (ia|jb), computed in place of `num` and damped by 1 - exp(kappa * denom) for
+    kappa-MP2 if `eris` carries `kappa` (see `pyscf.lno.lno._DressedERIS`).
     '''
-    return _regularize(eris, np.conj(num) / denom, denom)
-
-def _regularize(eris, t2, denom):
-    r''' Damp the MP2 amplitudes `t2` in place by 1 - exp(kappa * denom) if `eris` carries
-    a kappa-MP2 `kappa` (see `pyscf.lno.lno._DressedERIS`).
-    '''
+    t2 = np.conj(num, out=num) if conj else num
+    t2 /= denom
     kappa = getattr(eris, 'kappa', None)
     if kappa is not None:
         t2 *= kappa_factor(denom, kappa)

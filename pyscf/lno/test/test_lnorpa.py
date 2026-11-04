@@ -20,7 +20,7 @@ from pyscf import gto, scf, cc, lo, lib
 from pyscf.lno import LNOCCSD, ULNOCCSD, drpa
 from pyscf.lno import make_lno_rdm1
 from pyscf.lno.lno import _DressedERIS
-from pyscf.regmp import driccd
+from pyscf.regpt2 import driccd
 
 
 def exact_drccd(V, eia):

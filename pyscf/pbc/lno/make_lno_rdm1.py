@@ -19,13 +19,14 @@
 '''
 import sys
 import numpy as np
+from functools import reduce
 
 from pyscf import lib
 from pyscf.lib import logger
 from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import (subspace_eigh, _mp2_rdm1_occblksize, _mp2_rdm1_virblksize,
-                                     _regularize)
+                                     _make_t2)
 from pyscf.pbc.lno.tools import zdotCNtoR
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_k2s_DEBUG_BLKSIZE', False)
@@ -123,9 +124,7 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
             denom = lib.direct_sum('ia+jb->iajb', eiv, ejv)
             t2ijvv = np.ndarray((ivLR.shape[0],jvLR.shape[0]), dtype=REAL, buffer=buf)
             zdotCNtoR(ivLR, ivLI, jvLR.T, jvLI.T, cR=t2ijvv)
-            t2ijvv = t2ijvv.reshape(*denom.shape)
-            t2ijvv /= denom
-            t2ijvv = _regularize(eris, t2ijvv, denom)
+            t2ijvv = _make_t2(eris, t2ijvv.reshape(*denom.shape), denom)
             jvLR = jvLI = None
             denom = None
             if with_occ:
@@ -190,9 +189,7 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
             ivLI = ivLI.reshape(-1,naux)
             t2ivKv = np.ndarray((ivLR.shape[0],KvLR.shape[0]), dtype=REAL, buffer=buf1)
             zdotCNtoR(ivLR, ivLI, KvLR.T, KvLI.T, cR=t2ivKv)
-            t2ivKv = t2ivKv.reshape(*eivKv.shape)
-            t2ivKv /= eivKv
-            t2ivKv = _regularize(eris, t2ivKv, eivKv)
+            t2ivKv = _make_t2(eris, t2ivKv.reshape(*eivKv.shape), eivKv)
             ivLR = ivLI = None
             eivKv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
@@ -206,9 +203,7 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
                     jvLI = jvLI.reshape(-1,naux)
                     t2jvKv = np.ndarray((jvLR.shape[0],KvLR.shape[0]), dtype=REAL, buffer=buf2)
                     zdotCNtoR(jvLR, jvLI, KvLR.T, KvLI.T, cR=t2jvKv)
-                    t2jvKv = t2jvKv.reshape(*ejvKv.shape)
-                    t2jvKv /= ejvKv
-                    t2jvKv = _regularize(eris, t2jvKv, ejvKv)
+                    t2jvKv = _make_t2(eris, t2jvKv.reshape(*ejvKv.shape), ejvKv)
                     jvLR = jvLI = None
                     ejvKv = None
 
@@ -272,9 +267,7 @@ def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
             obLI = obLI.reshape(-1,naux)
             t2oAob = np.ndarray((oALR.shape[0],obLR.shape[0]), dtype=REAL, buffer=buf)
             zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
-            t2oAob = t2oAob.reshape(*eoAob.shape)
-            t2oAob /= eoAob
-            t2oAob = _regularize(eris, t2oAob, eoAob)
+            t2oAob = _make_t2(eris, t2oAob.reshape(*eoAob.shape), eoAob)
             eoAob = None
             obLR = obLI = None
 
@@ -343,9 +336,7 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
             eoAoB = lib.direct_sum('iA+jB->iAjB', eoA, eoB)
             t2oAoB = np.ndarray((oALR.shape[0], oBLR.shape[0]), dtype=REAL, buffer=buf)
             zdotCNtoR(oALR, oALI, oBLR.T, oBLI.T, cR=t2oAoB)
-            t2oAoB = t2oAoB.reshape(*eoAoB.shape)
-            t2oAoB /= eoAoB
-            t2oAoB = _regularize(eris, t2oAoB, eoAoB)
+            t2oAoB = _make_t2(eris, t2oAoB.reshape(*eoAoB.shape), eoAoB)
             eoAoB = None
             oBLR = oBLI = None
 
@@ -409,9 +400,7 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
             oaLI = oaLI.reshape(-1,naux)
             t2oAoa = np.ndarray((oALR.shape[0], oaLR.shape[0]), dtype=REAL, buffer=buf1)
             zdotCNtoR(oALR, oALI, oaLR.T, oaLI.T, cR=t2oAoa)
-            t2oAoa = t2oAoa.reshape(*eoAoa.shape)
-            t2oAoa /= eoAoa
-            t2oAoa = _regularize(eris, t2oAoa, eoAoa)
+            t2oAoa = _make_t2(eris, t2oAoa.reshape(*eoAoa.shape), eoAoa)
             eoAoa = None
             oaLR = oaLI = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
@@ -425,9 +414,7 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
                     obLI = obLI.reshape(-1,naux)
                     t2oAob = np.ndarray((oALR.shape[0], obLR.shape[0]), dtype=REAL, buffer=buf2)
                     zdotCNtoR(oALR, oALI, obLR.T, obLI.T, cR=t2oAob)
-                    t2oAob = t2oAob.reshape(*eoAob.shape)
-                    t2oAob /= eoAob
-                    t2oAob = _regularize(eris, t2oAob, eoAob)
+                    t2oAob = _make_t2(eris, t2oAob.reshape(*eoAob.shape), eoAob)
                     eoAob = None
                     obLR = obLI = None
 
@@ -491,9 +478,7 @@ def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
             jvLI = jvLI.reshape(-1,naux)
             t2Ivjv = np.ndarray((IvLR.shape[0], jvLR.shape[0]), dtype=REAL, buffer=buf)
             zdotCNtoR(IvLR, IvLI, jvLR.T, jvLI.T, cR=t2Ivjv)
-            t2Ivjv = t2Ivjv.reshape(*eIvjv.shape)
-            t2Ivjv /= eIvjv
-            t2Ivjv = _regularize(eris, t2Ivjv, eIvjv)
+            t2Ivjv = _make_t2(eris, t2Ivjv.reshape(*eIvjv.shape), eIvjv)
             eIvjv = None
             jvLR = jvLI = None
 
@@ -562,9 +547,7 @@ def make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, u):
             eIvJv = lib.direct_sum('Ia+Jb->IaJb', eIv, eJv)
             t2IvJv = np.ndarray((IvLR.shape[0], JvLR.shape[0]), dtype=REAL, buffer=buf)
             zdotCNtoR(IvLR, IvLI, JvLR.T, JvLI.T, cR=t2IvJv)
-            t2IvJv = t2IvJv.reshape(*eIvJv.shape)
-            t2IvJv /= eIvJv
-            t2IvJv = _regularize(eris, t2IvJv, eIvJv)
+            t2IvJv = _make_t2(eris, t2IvJv.reshape(*eIvJv.shape), eIvJv)
             eIvJv = None
             JvLR = JvLI = None
 
@@ -623,9 +606,7 @@ def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
             t2iKvv = 0
             for q1,q2 in enumerate(eris.qconserv):
                 t2iKvv += lib.einsum('iax,Kbx->iKab', eris.get_occ_blk(q1,i0,i1), KvL[q2])
-            conj_(t2iKvv)
-            t2iKvv /= eiKvv
-            t2iKvv = _regularize(eris, t2iKvv, eiKvv)
+            t2iKvv = _make_t2(eris, t2iKvv, eiKvv)
             eiKvv = None
             for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
                 if jbatch == ibatch:
@@ -636,9 +617,7 @@ def make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, u):
                     t2jKvv = 0
                     for q1,q2 in enumerate(eris.qconserv):
                         t2jKvv += lib.einsum('iax,Kbx->iKab', eris.get_occ_blk(q1,j0,j1), KvL[q2])
-                    conj_(t2jKvv)
-                    t2jKvv /= ejKvv
-                    t2jKvv = _regularize(eris, t2jKvv, ejKvv)
+                    t2jKvv = _make_t2(eris, t2jKvv, ejKvv)
                     ejKvv = None
 
                 dm[i0:i1,j0:j1] -= 4 * lib.einsum('iKab,jKab->ij', np.conj(t2iKvv), t2jKvv)
@@ -693,9 +672,7 @@ def make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, u):
             t2ooAb = 0
             for q1,q2 in enumerate(eris.qconserv):
                 t2ooAb += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,b0,b1))
-            conj_(t2ooAb)
-            t2ooAb /= eooAb
-            t2ooAb = _regularize(eris, t2ooAb, eooAb)
+            t2ooAb = _make_t2(eris, t2ooAb, eooAb)
             eooAb = None
 
             dm -= 2 * lib.einsum('ikAb,jkAb->ij', np.conj(t2ooAb), t2ooAb)
@@ -758,9 +735,7 @@ def make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, u):
             else:
                 for q1,q2 in enumerate(eris.qconserv):
                     t2ooAB += lib.einsum('iAx,jBx->ijAB', oAL[q1], eris.xform_vir(q2, u[:,B0:B1]))
-            conj_(t2ooAB)
-            t2ooAB /= eooAB
-            t2ooAB = _regularize(eris, t2ooAB, eooAB)
+            t2ooAB = _make_t2(eris, t2ooAB, eooAB)
 
             eooAB = None
 
@@ -816,9 +791,7 @@ def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
             t2ooAa = 0
             for q1,q2 in enumerate(eris.qconserv):
                 t2ooAa += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,a0,a1))
-            conj_(t2ooAa)
-            t2ooAa /= eooAa
-            t2ooAa = _regularize(eris, t2ooAa, eooAa)
+            t2ooAa = _make_t2(eris, t2ooAa, eooAa)
             eooAa = None
             for bbatch,(b0,b1) in enumerate(lib.prange(0,nvir,virblksize)):
                 if abatch == bbatch:
@@ -829,9 +802,7 @@ def make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, u):
                     t2ooAb = 0
                     for q1,q2 in enumerate(eris.qconserv):
                         t2ooAb += lib.einsum('iAx,jbx->ijAb', oAL[q1], eris.get_vir_blk(q2,b0,b1))
-                    conj_(t2ooAb)
-                    t2ooAb /= eooAb
-                    t2ooAb = _regularize(eris, t2ooAb, eooAb)
+                    t2ooAb = _make_t2(eris, t2ooAb, eooAb)
                     eooAb = None
 
                 dm[a0:a1,b0:b1] += 4 * lib.einsum('ijAa,ijAb->ab', t2ooAa, np.conj(t2ooAb))
@@ -887,9 +858,7 @@ def make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, u):
             t2Ijvv = 0
             for q1,q2 in enumerate(eris.qconserv):
                 t2Ijvv += lib.einsum('Iax,jbx->Ijab', IvL[q1], eris.get_occ_blk(q2,j0,j1))
-            conj_(t2Ijvv)
-            t2Ijvv /= eIjvv
-            t2Ijvv = _regularize(eris, t2Ijvv, eIjvv)
+            t2Ijvv = _make_t2(eris, t2Ijvv, eIjvv)
             eIjvv = None
 
             dm += 2 * lib.einsum('Ijac,Ijbc->ab', t2Ijvv, np.conj(t2Ijvv))
@@ -952,9 +921,7 @@ def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u):
             else:
                 for q1,q2 in enumerate(eris.qconserv):
                     t2IJvv += lib.einsum('Iax,Jbx->IJab', IvL[q1], eris.xform_occ(q2, u[:,J0:J1]))
-            conj_(t2IJvv)
-            t2IJvv /= eIJvv
-            t2IJvv = _regularize(eris, t2IJvv, eIJvv)
+            t2IJvv = _make_t2(eris, t2IJvv, eIJvv)
 
             eIJvv = None
 
@@ -965,6 +932,121 @@ def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u):
         IvL = None
 
     return dm
+
+''' make lo rdm1 from k-point integrals
+'''
+def make_lo_rdm1_1h_occ_k(eris, u):
+    r''' Occupied '1h' MP2 density matrix from k-point integrals (see `make_lo_rdm1_1h_k`). '''
+    return make_lo_rdm1_1h_k(eris, u, with_vir=False)[0]
+
+def make_lo_rdm1_1h_vir_k(eris, u):
+    r''' Virtual '1h' MP2 density matrix from k-point integrals (see `make_lo_rdm1_1h_k`). '''
+    return make_lo_rdm1_1h_k(eris, u, with_occ=False)[1]
+
+def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
+    r''' Occupied and virtual MP2 density matrices with one localized hole, from the k-point
+    DF integrals of the Bloch orbitals (`pyscf.pbc.lno.klno._KLNODFKERIS`)
+
+        Math:
+            dm(i,j) = \sum_{Kac} t2(Kiac).conj() * ( 2*t2(Kjca) - 4*t2(Kjac) )
+            dm(a,b) = \sum_{Ijc} t2(Ijac) * X(Ijbc).conj() + t2(Ijca) * X(Ijcb).conj()
+            X(Ijac) = 2*t2(Ijac) - t2(Ijca)
+            t2(Ijac) = (Ia|jc).conj() / (e_I + e_j - e_a - e_c)
+
+        as `make_lo_rdm1_occ_1h_real` and `make_lo_rdm1_vir_1h_real`, with j, a, c Bloch
+        orbitals and I = \sum_{ki} |k i> C(k i,I) the semicanonical fragment orbitals.
+        Momentum conservation fixes k_I = k_a - k_j + k_c, so each block of (Ia|jc) needs
+        the integrals Lov[kI,ka] and Lov[kj,kc] of one momentum transfer q = k_a - k_I.
+
+        The amplitudes are made for a block of I and one k_c at a time, as the slabs
+            A(Ijac) = t2(Ijac),  B(Ijca) = t2(Ijca)     (c in k_c; j, a in all k)
+        which hold every amplitude the density matrices need for c in k_c. Each amplitude
+        is thus made twice (in the slab of k_c and in that of k_a), but no amplitude array
+        is larger than (nI, Nk*nocc, Nk*nvir, nvir).
+
+        Args:
+            eris : _KLNODFKERIS
+                Provides the k-point integrals `Lov`, Bloch orbital energies
+                `mo_energy_occ`/`mo_energy_vir` (Nk,nocc)/(Nk,nvir), and the overlaps
+                `Wocc`/`Wvir` between the Bloch and the supercell canonical orbitals.
+            u : np.ndarray
+                Overlap between the supercell canonical and localized occupied orbitals,
+                i.e., u(i,i') = <i|i'>
+
+        Returns:
+            dm_occ, dm_vir in the supercell canonical orbitals (None if not requested).
+    '''
+    Lov, kconserv = eris.Lov, eris.kconserv
+    eo, ev = eris.mo_energy_occ, eris.mo_energy_vir
+    nkpts, nocc = eo.shape
+    nvir = ev.shape[1]
+    nko, nkv = nkpts*nocc, nkpts*nvir
+    naux = max(L.shape[0] for L in Lov.ravel())
+    COMPLEX = np.complex128
+    dsize = 16
+
+    # semicanonical fragment orbitals in the Bloch basis
+    eI, cI = subspace_eigh(np.diag(eo.ravel()), np.dot(eris.Wocc, u))
+    cI = cI.reshape(nkpts,nocc,-1)
+    nOcc = eI.size
+    evall = ev.ravel()
+
+    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (A, B, temporaries)
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    mem_fix = (nko**2*with_occ + nkv**2*with_vir) * dsize/1e6
+    mem_I = (nkpts*naux*nkv + 6*nko*nkv*nvir) * dsize/1e6
+    Occblksize = max(1, min(nOcc, int(np.floor((mem_avail*0.7 - mem_fix) / mem_I))))
+    if DEBUG_BLKSIZE: Occblksize = max(1,nOcc//2)
+    logger.debug1(eris, 'make_lo_rdm1_1h_k :  nkpts = %d  nocc = %d  nvir = %d  nOcc = %d  '
+                  'naux = %d  Occblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nOcc,
+                  naux, Occblksize, mem_fix + Occblksize*mem_I)
+
+    dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
+    dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
+    for I0,I1 in lib.prange(0,nOcc,Occblksize):
+        nI = I1 - I0
+        eIv = eI[I0:I1]
+        # IvL[q][ka] = (I a|L), a in k_a, of momentum q = k_a - k_I: (naux_q, nI*nvir)
+        IvL = [[lib.einsum('Lia,iI->LIa', Lov[kconserv[ka,q,0],ka],
+                           cI[kconserv[ka,q,0],:,I0:I1].conj()).reshape(-1,nI*nvir)
+                for ka in range(nkpts)] for q in range(nkpts)]
+        A = np.empty((nI,nkpts,nocc,nkpts,nvir,nvir), dtype=COMPLEX)
+        B = np.empty((nI,nkpts,nocc,nvir,nkpts,nvir), dtype=COMPLEX)
+        for kc in range(nkpts):
+            for kj in range(nkpts):
+                # A: (I a|j c) with q = k_j - k_c;  B: (I c|j a) with q = k_j - k_a
+                ovL = Lov[kj,kc].reshape(-1,nocc*nvir)
+                for ka in range(nkpts):
+                    num = lib.dot(IvL[kconserv[kj,kc,0]][ka].T, ovL)
+                    A[:,kj,:,ka] = num.reshape(nI,nvir,nocc,nvir).transpose(0,2,1,3)
+                    num = lib.dot(IvL[kconserv[kj,ka,0]][kc].T, Lov[kj,ka].reshape(-1,nocc*nvir))
+                    B[:,kj,:,:,ka] = num.reshape(nI,nvir,nocc,nvir).transpose(0,2,1,3)
+                num = ovL = None
+                # amplitudes in place (A[:,kj] and B[:,kj] are views)
+                denom = lib.direct_sum('I+j-a-c->Ijac', eIv, eo[kj], evall, ev[kc])
+                _make_t2(eris, A[:,kj], denom.reshape(A.shape[:1]+A.shape[2:]))
+                denom = lib.direct_sum('I+j-c-a->Ijca', eIv, eo[kj], ev[kc], evall)
+                _make_t2(eris, B[:,kj], denom.reshape(B.shape[:1]+B.shape[2:]))
+                denom = None
+            a = A.reshape(nI,nko,nkv,nvir)
+            b = B.reshape(nI,nko,nvir,nkv)
+            if with_vir:
+                X = (2*a - b.transpose(0,1,3,2)).conj()
+                dmvv += lib.einsum('Ijac,Ijbc->ab', a, X)
+                X = (2*b - a.transpose(0,1,3,2)).conj()
+                dmvv += lib.einsum('Ijca,Ijcb->ab', b, X)
+            if with_occ:
+                X = 2*b.transpose(0,1,3,2) - 4*a
+                dmoo += lib.einsum('Kiac,Kjac->ij', a.conj(), X)
+            X = a = b = None
+        A = B = IvL = None
+
+    # Bloch -> supercell canonical orbitals
+    if with_occ:
+        dmoo = _check_dm_imag(eris, reduce(np.dot, (eris.Wocc.T.conj(), dmoo, eris.Wocc)))
+    if with_vir:
+        dmvv = _check_dm_imag(eris, reduce(np.dot, (eris.Wvir.T.conj(), dmvv, eris.Wvir)))
+    return dmoo, dmvv
 
 def conj_(a):
     # in-place conjugate

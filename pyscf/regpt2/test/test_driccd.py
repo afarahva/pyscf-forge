@@ -17,11 +17,11 @@
 import unittest
 import numpy as np
 from pyscf import gto, scf, lib
-from pyscf import regmp
+from pyscf import regpt2
 
 # HF dimer (A24 database), aug-cc-pVDZ, frozen F 1s; DF correlation with aug-cc-pVDZ-RI
 def setUpModule():
-    global mol, mf, umf, frozen
+    global mol, mf, frozen
     mol = gto.Mole()
     mol.verbose = 5
     mol.output = '/dev/null'
@@ -34,37 +34,41 @@ def setUpModule():
     mol.basis = 'aug-cc-pvdz'
     mol.build()
     mf = scf.RHF(mol).run(conv_tol=1e-10)
-    umf = scf.UHF(mol).run(conv_tol=1e-10)
     frozen = 2
 
 def tearDownModule():
-    global mol, mf, umf
+    global mol, mf
     mol.stdout.close()
-    del mol, mf, umf
+    del mol, mf
 
 
 class KnownValues(unittest.TestCase):
-    def test_alpha0_is_mp2(self):
-        m = regmp.BWS2(mf, frozen=frozen, alpha=0).run()
-        self.assertAlmostEqual(m.e_corr, -0.4460262474, 8)     # DF-MP2
-
-    def test_bws2(self):
-        m = regmp.BWS2(mf, frozen=frozen, alpha=1).run()
-        self.assertTrue(m.converged)
-        self.assertAlmostEqual(m.e_corr, -0.4403837763, 8)
-        self.assertAlmostEqual(m.e_corr_ss, -0.1182116092, 8)
-        self.assertAlmostEqual(m.e_corr_os, -0.3221721672, 8)
-        m = regmp.BWS2(mf, frozen=frozen, alpha=4).run()
-        self.assertAlmostEqual(m.e_corr, -0.4252053682, 8)
-
-    def test_rdm1(self):
-        m = regmp.BWS2(mf, frozen=frozen, alpha=1).run()
+    def test_eig(self):
+        m = regpt2.DRICCD(mf, frozen=frozen)
+        m.solver = 'eig'
+        m.run()
+        self.assertAlmostEqual(m.e_corr, -0.4934770122, 8)
+        self.assertAlmostEqual(m.e_corr_sosex, -0.3262294408, 8)
         dm = m.make_rdm1()
         self.assertAlmostEqual(np.trace(dm), mol.nelectron, 9)
-        self.assertAlmostEqual(lib.fp(dm), 2.1140373881, 7)
+        self.assertAlmostEqual(lib.fp(dm), 2.1161757689, 7)
         self.assertRaises(NotImplementedError, m.make_rdm2)
+
+    def test_riccati(self):
+        m = regpt2.DRICCD(mf, frozen=frozen).run()
+        self.assertTrue(m.converged)
+        self.assertAlmostEqual(m.e_corr, -0.4934770122, 6)
+        self.assertAlmostEqual(m.e_corr_sosex, -0.3262294408, 6)
+
+    def test_without_sosex(self):
+        m = regpt2.DRICCD(mf, frozen=frozen)
+        m.with_sosex = False
+        m.kernel(with_t2=False)
+        self.assertTrue(m.e_corr_sosex is None)
+        self.assertTrue(m.t2 is None)
+        self.assertAlmostEqual(m.e_corr, -0.4934770122, 6)
 
 
 if __name__ == "__main__":
-    print("Full Tests for BW-s2(alpha)")
+    print("Full Tests for drCCD (direct RPA)")
     unittest.main()

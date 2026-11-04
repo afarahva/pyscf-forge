@@ -35,7 +35,7 @@ from pyscf.lib import logger
 from pyscf import lib
 
 from pyscf.lno import LNO
-from pyscf.regmp.kappamp2 import kappa_factor
+from pyscf.regpt2.kappamp2 import kappa_factor
 from pyscf.lno import drpa
 from pyscf.lno.lno import PT2_LABELS
 from pyscf.lno.tools import df_loop

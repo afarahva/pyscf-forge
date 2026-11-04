@@ -291,7 +291,7 @@ def _release_eris(eris):
         except Exception:
             pass
         eris.feri = None
-    for key in ('ovL', 'ovLR', 'ovLI'):
+    for key in ('ovL', 'ovLR', 'ovLI', 'Lov'):
         if hasattr(eris, key):
             setattr(eris, key, None)
 
@@ -431,16 +431,6 @@ def sub_colspace(A, idx):
         return np.zeros([A.shape[0],0])
     else:
         return A[:,idx]
-
-def get_fragment_energy(oovv, t2, uloc):
-    m = np.dot(uloc, uloc.T.conj())
-    ed =  einsum('ijab,kjab,ik->', t2, oovv, m) * 2
-    ex = -einsum('ijab,kjba,ik->', t2, oovv, m)
-    ed = ed.real
-    ex = ex.real
-    ess = ed*0.5 + ex
-    eos = ed*0.5
-    return lib.tag_array(ess+eos, spin_comp=np.array((ess, eos)))
 
 
 class LNO(lib.StreamObject):
@@ -858,7 +848,7 @@ class LNO(lib.StreamObject):
 
     def solve_rpa(self, eris):
         r''' Full-system drCCD from `eris`. Sets `e_corr_rpa_full` and `e_corr_sosex_full`
-        and returns the dressed integrals U[i,a,P] (see `pyscf.regmp.driccd`).
+        and returns the dressed integrals U[i,a,P] (see `pyscf.regpt2.driccd`).
         '''
         log = logger.new_logger(self)
         mrpa = self.DRPA()
@@ -1113,7 +1103,7 @@ class _DressedERIS:
         damps the amplitudes, t2 *= 1 - exp(kappa * (e_i + e_j - e_a - e_b))   (kappa-MP2)
 
     or replaces its integrals by the in-core, real dressed integrals `ovL`, U = (1 + 2T) J,
-    whose MP2 amplitudes are the drCCD ones (dRPA, see `pyscf.regmp.driccd`).
+    whose MP2 amplitudes are the drCCD ones (dRPA, see `pyscf.regpt2.driccd`).
     '''
     def __init__(self, eris, kappa=None, ovL=None):
         if ovL is not None:
