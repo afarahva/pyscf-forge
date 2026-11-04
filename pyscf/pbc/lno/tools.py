@@ -29,13 +29,19 @@ def is_trs_kmesh(cell, kpts):
 
 
 def k2s_scf(kmf, fock_imag_tol=1e-6, lindep_thresh=None):
-    r''' lindep_thresh: if given, solve the supercell eigenproblem by canonical orthogonalization,
-    dropping overlap eigenvectors with eigenvalue <= lindep_thresh (use the threshold the k-point
-    SCF used, e.g. pyscf.scf.hf.overlap_zero_eigenvalue_threshold). The supercell then has fewer
-    MOs than AOs, as a molecular SCF does after linear-dependency removal. If None, a plain
-    generalized eigh is used, which fails when the supercell overlap is numerically singular.
+    r''' Supercell RHF equivalent to the KRHF `kmf`.
+
+    The supercell MOs are the eigenvectors of the supercell Fock matrix within the span of the
+    k-point MOs, so they span the same space as `kmf.mo_coeff` and have the same orbital
+    energies. MOs removed by the linear-dependency handling of the k-point SCF (zero columns
+    or missing columns of `kmf.mo_coeff`, whatever their placeholder energies) are left out,
+    and the supercell then has fewer MOs than AOs. For k-meshes closed under k -> -k the
+    supercell MOs are real.
+
+    lindep_thresh: not used (kept for compatibility); the removed directions follow from
+    `kmf.mo_coeff` itself.
     '''
-    from pyscf.scf.hf import eig, _adjust_phase_
+    from pyscf.scf.hf import _adjust_phase_
     from pyscf.pbc import scf
 
     if not kmf.istype('KRHF'):
@@ -61,24 +67,23 @@ def k2s_scf(kmf, fock_imag_tol=1e-6, lindep_thresh=None):
     ks1e = kmf.get_ovlp()
     kh1e = kmf.get_hcore()
 
+    # the k-point MOs kept by the k-point SCF: normalized columns, <p|p> = 1 (removed ones are 0)
     ksc = [np.dot(s1e,mo_coeff) for s1e,mo_coeff in zip(ks1e,kmo_coeff)]
-    kfock = np.asarray([np.dot(sc*moe,sc.T.conj()) for sc,moe in zip(ksc,kmo_energy)])
+    keep = [lib.einsum('pi,pi->i', c.conj(), sc).real > 0.5 for c,sc in zip(kmo_coeff,ksc)]
+    kfock = np.asarray([np.dot(sc[:,k]*moe[k],sc[:,k].T.conj())
+                        for sc,moe,k in zip(ksc,kmo_energy,keep)])
+    kproj = np.asarray([np.dot(c[:,k],c[:,k].T.conj()) for c,k in zip(kmo_coeff,keep)])
 
     s1e = _k2s_aoint(cell, ks1e, kpts, phase, 's1e')
     h1e = _k2s_aoint(cell, kh1e, kpts, phase, 'h1e')
     fock = _k2s_aoint(cell, kfock, kpts, phase, 'fock')
+    proj = _k2s_aoint(cell, kproj, kpts, phase, 'proj')
 
-    if lindep_thresh is None:
-        mo_energy, mo_coeff = eig(fock, s1e)
-    else:
-        se, sv = scipy.linalg.eigh(s1e)
-        keep = se > lindep_thresh
-        x = sv[:,keep] / np.sqrt(se[keep])
-        mo_energy, c = scipy.linalg.eigh(reduce(np.dot, (x.conj().T, fock, x)))
-        mo_coeff = _adjust_phase_(x.dot(c))
-        if keep.sum() < len(se):
-            sys.stderr.write('k2s_scf: %d small eigenvectors of the supercell overlap removed\n'
-                             % (len(se) - keep.sum()))
+    # diagonalize the Fock matrix in the span of the kept MOs: the range v of their projector
+    v = scipy.linalg.eigh(proj)[1][:,-sum(k.sum() for k in keep):]
+    mo_energy, c = scipy.linalg.eigh(reduce(np.dot, (v.conj().T, fock, v)),
+                                     reduce(np.dot, (v.conj().T, s1e, v)))
+    mo_coeff = _adjust_phase_(np.dot(v, c))
 
     if isinstance(dfobj, RSDF):
         mf = scf.RHF(scell, kpt=kpts[0]).rs_density_fit(auxbasis=dfobj.auxbasis)

@@ -991,9 +991,10 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
     nOcc = eI.size
     evall = ev.ravel()
 
-    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (A, B, temporaries)
+    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (A, B, temporaries);
+    # fixed, the density matrices and the integrals regrouped by q (Lq)
     mem_avail = eris.max_memory - lib.current_memory()[0]
-    mem_fix = (nko**2*with_occ + nkv**2*with_vir) * dsize/1e6
+    mem_fix = (nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
     mem_I = (nkpts*naux*nkv + 6*nko*nkv*nvir) * dsize/1e6
     Occblksize = max(1, min(nOcc, int(np.floor((mem_avail*0.7 - mem_fix) / mem_I))))
     if DEBUG_BLKSIZE: Occblksize = max(1,nOcc//2)
@@ -1001,27 +1002,40 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
                   'naux = %d  Occblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nOcc,
                   naux, Occblksize, mem_fix + Occblksize*mem_I)
 
+    # Lq[q] = (j a|L) of all k_j, with k_a = k_j - q: (naux_q, Nk*nocc*nvir)
+    kjs = np.arange(nkpts)
+    Lq = [np.hstack([Lov[kj,kconserv[kj,q,0]].reshape(-1,nocc*nvir) for kj in kjs])
+          for q in range(nkpts)]
+
     dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
     dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
     for I0,I1 in lib.prange(0,nOcc,Occblksize):
         nI = I1 - I0
         eIv = eI[I0:I1]
-        # IvL[q][ka] = (I a|L), a in k_a, of momentum q = k_a - k_I: (naux_q, nI*nvir)
-        IvL = [[lib.einsum('Lia,iI->LIa', Lov[kconserv[ka,q,0],ka],
-                           cI[kconserv[ka,q,0],:,I0:I1].conj()).reshape(-1,nI*nvir)
-                for ka in range(nkpts)] for q in range(nkpts)]
+        # IvL[q][:,ka] = (I a|L), a in k_a, of momentum q = k_a - k_I: (naux_q, Nk, nI, nvir)
+        IvL = []
+        for q in range(nkpts):
+            Iv = np.empty((Lov[kconserv[0,q,0],0].shape[0],nkpts,nI,nvir), dtype=COMPLEX)
+            for ka in range(nkpts):
+                ki = kconserv[ka,q,0]
+                Iv[:,ka] = lib.einsum('Lia,iI->LIa', Lov[ki,ka], cI[ki,:,I0:I1].conj())
+            IvL.append(Iv)
         A = np.empty((nI,nkpts,nocc,nkpts,nvir,nvir), dtype=COMPLEX)
         B = np.empty((nI,nkpts,nocc,nvir,nkpts,nvir), dtype=COMPLEX)
         for kc in range(nkpts):
+            # (I c|L) of c in k_c for each q
+            IcL = [np.asarray(Iv[:,kc], order='C').reshape(Iv.shape[0],-1) for Iv in IvL]
+            # A: (I a|j c), a in all k, with q = k_j - k_c: one product per k_j
             for kj in range(nkpts):
-                # A: (I a|j c) with q = k_j - k_c;  B: (I c|j a) with q = k_j - k_a
-                ovL = Lov[kj,kc].reshape(-1,nocc*nvir)
-                for ka in range(nkpts):
-                    num = lib.dot(IvL[kconserv[kj,kc,0]][ka].T, ovL)
-                    A[:,kj,:,ka] = num.reshape(nI,nvir,nocc,nvir).transpose(0,2,1,3)
-                    num = lib.dot(IvL[kconserv[kj,ka,0]][kc].T, Lov[kj,ka].reshape(-1,nocc*nvir))
-                    B[:,kj,:,:,ka] = num.reshape(nI,nvir,nocc,nvir).transpose(0,2,1,3)
-                num = ovL = None
+                Iv = IvL[kconserv[kj,kc,0]]
+                num = lib.dot(Iv.reshape(Iv.shape[0],-1).T, Lov[kj,kc].reshape(-1,nocc*nvir))
+                A[:,kj] = num.reshape(nkpts,nI,nvir,nocc,nvir).transpose(1,3,0,2,4)
+            # B: (I c|j a) with q = k_j - k_a: one product per q, for all k_j (k_a = k_j - q)
+            for q in range(nkpts):
+                num = lib.dot(IcL[q].T, Lq[q]).reshape(nI,nvir,nkpts,nocc,nvir)
+                B[:,kjs,:,:,kconserv[kjs,q,0]] = num.transpose(2,0,3,1,4)
+            num = Iv = None
+            for kj in range(nkpts):
                 # amplitudes in place (A[:,kj] and B[:,kj] are views)
                 denom = lib.direct_sum('I+j-a-c->Ijac', eIv, eo[kj], evall, ev[kc])
                 _make_t2(eris, A[:,kj], denom.reshape(A.shape[:1]+A.shape[2:]))
@@ -1038,8 +1052,9 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
             if with_occ:
                 X = 2*b.transpose(0,1,3,2) - 4*a
                 dmoo += lib.einsum('Kiac,Kjac->ij', a.conj(), X)
-            X = a = b = None
+            X = a = b = IcL = None
         A = B = IvL = None
+    Lq = None
 
     # Bloch -> supercell canonical orbitals
     if with_occ:

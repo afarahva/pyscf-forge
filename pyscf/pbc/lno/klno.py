@@ -82,8 +82,8 @@ class KLNO(LNO):
             orbitals (`make_lno_rdm1.make_lo_rdm1_1h_k`) instead of the supercell-layout
             integrals: ~Nk/2 times less memory. For RPA/SOSEX LNOs the full-system drCCD
             is then solved with k-point symmetry (`pyscf.pbc.regpt2.kdriccd`). Used for
-            '1h'/'1h' LNOs with in-core integrals and active orbitals made of whole bands
-            (the same number per k-point); otherwise the supercell integrals are used.
+            '1h'/'1h' LNOs with in-core integrals and active orbitals made of whole bands;
+            otherwise the supercell integrals are used.
             Default is True.
     '''
 
@@ -161,7 +161,7 @@ class KLNO(LNO):
             occ = _bloch_orbitals(self._kscf, orbocc)
             vir = _bloch_orbitals(self._kscf, orbvir)
             if occ is None or vir is None:
-                reason = 'active orbitals are not whole bands with the same number per k-point'
+                reason = 'active orbitals are not whole bands'
             else:
                 nkpts, nocc = occ[0].shape
                 nvir = vir[0].shape[1]
@@ -253,12 +253,17 @@ def _bloch_orbitals(kmf, orb, tol=1e-6):
     r''' The Bloch orbitals of `kmf` spanning the supercell orbitals `orb` (supercell AO
     coefficients) and their overlap with them.
 
+    k-points with fewer such orbitals (e.g. after the linear-dependency removal of the k-point
+    SCF) are padded to the same number n with zero orbitals, whose integrals and overlaps are
+    zero; their energy is the highest (virtual) or lowest (occupied) energy of the others, so
+    that every energy denominator stays nonzero and their amplitudes are zero.
+
     Returns:
         mo_energy (Nk,n), mo_coeff (Nk,nao,n), W (Nk*n, norb) with W(k p,I) = <k p|I>;
-        or None if `orb` is not made of whole bands with the same number n per k-point.
+        or None if `orb` is not made of whole bands.
     '''
     korb = s2k_mo_coeff(kmf.cell, kmf.kpts, orb)
-    moe, mo, W = [], [], []
+    moe, mo, W, occ = [], [], [], []
     for k, s1e in enumerate(kmf.get_ovlp()):
         w = np.linalg.multi_dot((kmf.mo_coeff[k].T.conj(), s1e, korb[k]))
         wt = lib.einsum('pI,pI->p', w.conj(), w).real
@@ -268,8 +273,18 @@ def _bloch_orbitals(kmf, orb, tol=1e-6):
         moe.append(kmf.mo_energy[k][idx])
         mo.append(kmf.mo_coeff[k][:,idx])
         W.append(w[idx])
-    if len(set(len(e) for e in moe)) != 1 or sum(len(e) for e in moe) != orb.shape[1]:
+        occ.append(kmf.mo_occ[k][idx])
+    if sum(len(e) for e in moe) != orb.shape[1]:
         return None
+    n = max(len(e) for e in moe)
+    e_all = np.concatenate(moe)
+    epad = e_all.min() if (np.concatenate(occ) > 0).all() else e_all.max()
+    for k in range(len(moe)):
+        npad = n - len(moe[k])
+        if npad > 0:
+            moe[k] = np.append(moe[k], [epad]*npad)
+            mo[k] = np.hstack((mo[k], np.zeros((mo[k].shape[0],npad), dtype=mo[k].dtype)))
+            W[k] = np.vstack((W[k], np.zeros((npad,W[k].shape[1]), dtype=W[k].dtype)))
     return np.asarray(moe), np.asarray(mo), np.vstack(W)
 
 
