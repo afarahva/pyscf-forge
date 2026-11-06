@@ -272,8 +272,7 @@ class DLNO:
         for s in range(nspin):
             frzocc, actocc, actvir, frzvir = splits[s]
             self._check_lmo(d.lmo[s], actocc, s)
-            orbproj = np.hstack((frzocc, actocc, frzvir))
-            pao, ao2pao = make_pao(s1e, orbproj, self.pao_norm_thr)
+            pao, ao2pao = make_pao(s1e, actvir, self.pao_norm_thr)
             lmo_bp = get_bp_domain(mol, d.lmo[s], s1e, self.lmo_bp_domain_thr, dist,
                                    aoslices=aoslices)
             pao_bp = get_bp_domain(mol, pao, s1e, self.pao_bp_domain_thr, dist,

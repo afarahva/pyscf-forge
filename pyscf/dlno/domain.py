@@ -25,8 +25,7 @@ r''' Atomic domains for domain-based LNO (DLNO) methods.
     - Boughton-Pulay (BP) domain of an orbital: the smallest set of atoms (grown by
       population, then by distance) whose AOs reproduce the orbital to a completeness
       `bp_thr`, i.e., 1 - min_a ||phi - sum_{mu in D} a_mu chi_mu||^2 >= bp_thr.
-    - Projected atomic orbitals (PAOs): the AOs with the occupied (and frozen virtual) MOs
-      projected out; they span the active virtual space.
+    - Projected atomic orbitals (PAOs): the AOs projected onto the active virtual space.
     - Primary domain of an LMO: its BP domain extended by the BP domains of the PAOs
       centered on its BP-domain atoms.
 
@@ -138,9 +137,12 @@ def get_bp_domain(mol, orbs, s1e, bp_thr, dist, q_thr=None, aoslices=None):
         domains.append(np.sort(order[:n]))
     return domains
 
-def make_pao(s1e, orbproj, norm_thr=1e-4):
-    r''' Normalized PAOs, (1 - |p><p| S) applied to the AOs with the orbitals `orbproj`
-    (orthonormal, e.g. the occupied and frozen virtual MOs) projected out.
+def make_pao(s1e, orbvir, norm_thr=1e-4):
+    r''' Normalized PAOs: the AOs projected onto the active virtual space, |C_v><C_v| S.
+
+    Projecting onto the virtual MOs (rather than projecting the occupied MOs out of the
+    AOs) keeps the PAOs in the span of the mean-field MOs when near-linearly dependent AO
+    combinations were removed from it.
 
     Returns:
         pao : (nao, npao) array
@@ -148,8 +150,7 @@ def make_pao(s1e, orbproj, norm_thr=1e-4):
             a norm below `norm_thr`).
     '''
     nao = s1e.shape[0]
-    pao = np.eye(nao, dtype=np.result_type(s1e, orbproj)) - \
-            np.dot(orbproj, np.dot(orbproj.T.conj(), s1e))
+    pao = np.dot(orbvir, np.dot(orbvir.T.conj(), s1e))
     norm = np.sqrt(abs(lib.einsum('ui,ui->i', pao.conj(), np.dot(s1e, pao))))
     keep = np.where(norm > norm_thr)[0]
     ao2pao = np.full(nao, -1, dtype=int)
