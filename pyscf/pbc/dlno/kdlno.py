@@ -45,8 +45,12 @@ class KDLNO(DLNO):
         class KDLNOCCSD(KDLNO, KLNOCCSD): ...
 
     See `pyscf.dlno.dlno.DLNO` for the domain parameters; `domain_basis` must be 'full'.
+    The multipole moments for the pair screening use the BP domains of the LMOs
+    (`multipole_domain = 'bp'`): the primary domains of solids with diffuse basis sets can
+    span most of the supercell.
     '''
     domain_basis = 'full'
+    multipole_domain = 'bp'
     _mol_multipole = None
 
     @property

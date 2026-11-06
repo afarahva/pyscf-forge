@@ -80,17 +80,24 @@ class LMOMoments:
     '''
     def __init__(self, mol, e_occ, orbocc, e_vir, orbvir, order=4):
         orbocc = np.asarray(orbocc).ravel()
-        d = dipole_op(mol)
-        self.center = einsum('u,xuv,v->x', orbocc.conj(), d, orbocc).real
+        nao = orbocc.size
+        nvir = orbvir.shape[1]
+        orbvirH = orbvir.conj()
+
+        def moments(op):
+            # <a| op |i> and <i| op |i>, contracting the LMO first
+            t = np.dot(op, orbocc).reshape(-1,nao)
+            return np.dot(t, orbvirH).real, np.dot(t, orbocc.conj()).real
+
+        mu, center = moments(dipole_op(mol))
+        self.center = center
         self.e_vo = np.asarray(e_vir) - e_occ
-        self.mu = einsum('ua,xuv,v->xa', orbvir.conj(), d, orbocc).real
+        self.mu = mu.reshape(3,nvir)
         self.theta = self.omega = None
         if order > 2:
-            q = quadrupole_op(mol, self.center)
-            self.theta = einsum('ua,xyuv,v->xya', orbvir.conj(), q, orbocc).real
+            self.theta = moments(quadrupole_op(mol, self.center))[0].reshape(3,3,nvir)
         if order > 3:
-            o = octupole_op(mol, self.center)
-            self.omega = einsum('ua,xyzuv,v->xyza', orbvir.conj(), o, orbocc).real
+            self.omega = moments(octupole_op(mol, self.center))[0].reshape(3,3,3,nvir)
         self.order = order
 
 

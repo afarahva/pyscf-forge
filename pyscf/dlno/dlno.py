@@ -119,6 +119,10 @@ class DLNO:
             Default 1e-4.
         multipole_order : int
             Order of the multipole expansion of the pair energies (2, 3 or 4). Default 4.
+        multipole_domain : str
+            Atoms whose AOs expand an LMO and its PAOs for the multipole moments:
+            'primary' (its primary domain) or 'bp' (its BP domain, cheaper when the
+            primary domains are large, e.g. in solids). Default 'primary'.
         domain_basis : str
             'local' (molecules only): the domain is solved in the AO and auxiliary basis
             of its extended primary domain atoms. 'full': in the full AO basis.
@@ -139,6 +143,7 @@ class DLNO:
     pao_orth_thr = 1e-6
     pair_energy_thr = 1e-4
     multipole_order = 4
+    multipole_domain = 'primary'
     domain_basis = 'local'
 
     _dlno = None
@@ -216,7 +221,8 @@ class DLNO:
         log.info('domain_pao_thr = %s', self.domain_pao_thr)
         log.info('pao_orth_thr = %s', self.pao_orth_thr)
         log.info('pair_energy_thr = %s', self.pair_energy_thr)
-        log.info('multipole_order = %s', self.multipole_order)
+        log.info('multipole_order = %s  multipole_domain = %s', self.multipole_order,
+                 self.multipole_domain)
         return self
 
     def _check_amp(self, amp, name):
@@ -323,11 +329,16 @@ class DLNO:
 
     def _lmo_moments(self, d, s, i, aoslices):
         r''' Multipole moments of LMO i (spin s) with the semicanonical PAOs of its BP
-        domain atoms, projected onto its primary domain.
+        domain atoms, projected onto its primary (or BP, see `multipole_domain`) domain.
         '''
         mol = self.mol
         s1e = self.s1e
-        pd = d.lmo_pd[s][i]
+        if self.multipole_domain.lower() == 'primary':
+            pd = d.lmo_pd[s][i]
+        elif self.multipole_domain.lower() == 'bp':
+            pd = d.lmo_bp[s][i]
+        else:
+            raise ValueError('multipole_domain must be "primary" or "bp"')
         ao_idx = ao_index_by_atom(mol, pd, aoslices)
         s21 = s1e[ao_idx]
         s22 = s1e[np.ix_(ao_idx, ao_idx)]
