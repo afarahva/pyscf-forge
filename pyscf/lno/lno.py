@@ -44,7 +44,6 @@ from pyscf import __config__
 
 from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
 from pyscf.lno import drpa
-from pyscf.lno import domain
 from pyscf.lno.tools import df_loop
 
 einsum = lib.einsum
@@ -149,46 +148,14 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
             mlno._release_full_eris(eris)
             eris = None
 
-        # calculate domains/prune basis
-        if mlno.prune_lno_basis:
-            # compute domain
-            mf_frag, lnofrag, uocc_loc, eris, frozen = \
-                domain.prune_lno_basis(mf, lnofrag, orbloc, uocc_loc, eris,
-                                   frozen, bp_thr=mlno.lno_basis_thresh)
-
-            log.info('Domain: %d/%d basis functions', mf_frag.mol.nao,
-                     mf.mol.nao)
-
-            # set properties
-            mlno._scf = mf_frag
-            mlno._mo_occ = mf_frag.mo_occ
-            mlno._s1e = mlno._scf.get_ovlp()
-            mlno._h1e = None
-            mlno._vhf = None
-            mlno._precompute()
-            mlno.lnofrag=lnofrag.copy()
-
-        else:
-            mf_frag = mf
-
         # solve impurity problem
-        frag_res[ifrag], frag_msg = mlno.impurity_solve(mf_frag, lnofrag, uocc_loc, eris, frozen=frozen)
+        frag_res[ifrag], frag_msg = mlno.impurity_solve(mf, lnofrag, uocc_loc, eris, frozen=frozen)
         lnofrag = frozen = uocc_loc = None
         frag_eners[ifrag] = mlno._frag_res_to_dict(frag_res[ifrag])
         mlno._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
         cput2 = log.timer('Fragment %d imp sol '%(ifrag+1), *cput2)
         log.info('Fragment %d/%d  Sol: %s', ifrag+1, nfrag, frag_msg)
         cput1 = log.timer('Fragment %d'%(ifrag+1)+' '*(8-len(str(ifrag+1))), *cput1)
-
-        # reinitialize basis for active-space calc
-        if mlno.prune_lno_basis:
-            # reset properties
-            mlno._scf = mf
-            mlno._mo_occ = None
-            mlno._s1e = None
-            mlno._h1e = None
-            mlno._vhf = None
-            mlno._precompute()
 
     if eris is not None and eris_created_here:
         mlno._release_full_eris(eris)
@@ -489,10 +456,6 @@ class LNO(lib.StreamObject):
         self.frag_wghtlist = None
         self.verbose_imp = 0 # allow separate verbose level for `impurity_solve`
 
-        # domain parameters
-        self.prune_lno_basis = False  # whether or not to use domains
-        self.lno_basis_thresh = 0.02  # default Boughton-Pulay parameter
-
         # low-level amplitudes
         #   lno_amp : amplitudes for the LNO density matrices
         #             'mp2', 'kappa-mp2', 'rpa' or 'sosex' ('rpa' and 'sosex'
@@ -677,16 +640,21 @@ class LNO(lib.StreamObject):
 
         self._precompute()
 
-
-        frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
-                          self.lno_type, self.lno_thresh,
-                          self.lno_pct_occ, self.lno_norb, eris=eris)
+        frag_res = self._solve_frags(eris=eris)
 
         self._post_proc(frag_res, frag_wghtlist)
 
         self._finalize()
 
         return self.e_corr
+
+    def _solve_frags(self, eris=None):
+        r''' Build the LNO active space of each fragment and solve its impurity problem
+        (see the module-level `kernel`). Returns the `impurity_solve` result of each
+        fragment. Domain-based LNO methods (`pyscf.dlno`) replace this step.
+        '''
+        return kernel(self, self.lo_coeff, self.frag_lolist, self.lno_type, self.lno_thresh,
+                      self.lno_pct_occ, self.lno_norb, eris=eris)
 
     def ao2mo(self):
         log = logger.new_logger(self)
@@ -810,8 +778,6 @@ class LNO(lib.StreamObject):
         amp = str(amp).lower()
         if amp not in self._AMP_TYPES:
             raise ValueError('%s must be one of %s (got %s)' % (name, self._AMP_TYPES, amp))
-        if amp in ('rpa', 'sosex') and self.prune_lno_basis:
-            raise NotImplementedError('RPA/SOSEX amplitudes do not support prune_lno_basis.')
         return amp
 
     @property
