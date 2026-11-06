@@ -126,6 +126,15 @@ class DLNO:
         domain_basis : str
             'local' (molecules only): the domain is solved in the AO and auxiliary basis
             of its extended primary domain atoms. 'full': in the full AO basis.
+        full_domain_fallback : bool
+            Fragments whose virtual domain (PAO atoms) covers the whole system are solved
+            as in the parent LNO method, from the full-system integrals (with all occupied
+            orbitals). Their local MP2 energies are then taken from the full-system MP2
+            (`full_mp2`): exact for `e_corr_lmp2` when all fragments are full-domain, else
+            left undefined (NaN). Default False (True for KDLNO).
+        full_mp2 : float
+            Full-system MP2 correlation energy (per cell for KDLNO) for the fallback above;
+            computed when needed if not given.
 
     Results (after `kernel`, weighted by `frag_wghtlist`):
         efrag_lmp2      : local MP2 fragment energies in their domains
@@ -145,6 +154,9 @@ class DLNO:
     multipole_order = 4
     multipole_domain = 'primary'
     domain_basis = 'local'
+    full_domain_fallback = False
+    full_mp2 = None
+    frag_full_domain = None
 
     _dlno = None
     efrag_lmp2 = None
@@ -558,6 +570,21 @@ class DLNO:
         return get_frag_ump2(eris, [moes[s][1] for s in range(2)],
                              [moes[s][2] for s in range(2)], u, max_memory=self.max_memory)
 
+    def _full_domain(self, dom):
+        r''' Whether the fragment of domain `dom` falls back to the parent LNO method (see
+        `full_domain_fallback`). '''
+        return bool(self.full_domain_fallback) and len(dom.pao_atm) == self.mol.natm
+
+    def _nlo_per_unit(self):
+        r''' Number of LOs per unit of the full-system energies (the whole system). '''
+        return float(sum(x.shape[1] for x in self._per_spin(self.lo_coeff)))
+
+    def get_full_mp2(self):
+        r''' Full-system MP2 correlation energy (see `full_mp2`). '''
+        if self.full_mp2 is None:
+            raise NotImplementedError('Set `full_mp2` for the full-domain fallback.')
+        return self.full_mp2
+
     # ------------------------------------------------------------------------------
     # driver
     def _solve_frags(self, eris=None):
@@ -582,8 +609,13 @@ class DLNO:
         doms = [self.frag_domain(loidx) for loidx in self.frag_lolist]
         nspin = self._nspin
 
+        full = np.asarray([self._full_domain(dom) for dom in doms], dtype=bool)
+        self.frag_full_domain = full
+        if full.any():
+            log.info('DLNO: %d/%d fragments have a full-system domain and are solved as in '
+                     'the parent LNO method', full.sum(), nfrag)
         efrag_lmp2 = np.zeros(nfrag)
-        efrag_dist = np.asarray([dom.e_dist for dom in doms])
+        efrag_dist = np.asarray([0. if f else dom.e_dist for dom, f in zip(doms, full)])
         lmp2_done = np.zeros(nfrag, dtype=bool)
         for i, dic in enumerate(frag_eners):
             if dic is not None and dic.get('e_lmp2') is not None:
@@ -591,12 +623,31 @@ class DLNO:
                 lmp2_done[i] = True
         self.frag_domain_info = [None] * nfrag
 
-        order = sorted(range(nfrag), key=lambda i: _domain_key(doms[i]))
+        # domain fragments sorted by domain (to share integrals), full-domain ones last
+        order = sorted(range(nfrag), key=lambda i: (full[i], _domain_key(doms[i])))
         cache_key = dl = eris_dom = None
         df_cache = None
+        eris_full = None
         for ifrag in order:
             if frag_res[ifrag] is not None and lmp2_done[ifrag]:
                 log.info('Fragment %d/%d  Sol: restored', ifrag+1, nfrag)
+                continue
+            if full[ifrag]:
+                if eris_dom is not None:
+                    dl._release_full_eris(eris_dom)
+                dl = eris_dom = cache_key = df_cache = None
+                if eris_full is None:
+                    eris_full = self.ao2mo()
+                frag_res[ifrag], info = self._solve_full_domain_frag(ifrag, eris_full,
+                                                                     lno_pct_occ, lno_norb)
+                efrag_lmp2[ifrag] = np.nan
+                dic = self._frag_res_to_dict(frag_res[ifrag]) or {}
+                dic['e_lmp2'] = np.nan
+                dic['e_lmp2_dist'] = 0.
+                frag_eners[ifrag] = dic
+                self._chk_dump_frag(ifrag, 'energy', dic)
+                self.frag_domain_info[ifrag] = info
+                cput1 = log.timer('Fragment %d' % (ifrag+1) + ' '*(8-len(str(ifrag+1))), *cput1)
                 continue
             dom = doms[ifrag]
             key = _domain_key(dom)
@@ -648,13 +699,36 @@ class DLNO:
 
         if eris_dom is not None:
             dl._release_full_eris(eris_dom)
-        dl = eris_dom = None
+        if eris_full is not None:
+            self._release_full_eris(eris_full)
+        dl = eris_dom = eris_full = None
         self.save_lno = save_lno
         self.efrag_lmp2 = efrag_lmp2
         self.efrag_lmp2_dist = efrag_dist
         classname = self.__class__.__name__
         log.timer(classname+' '*(17-len(classname)), *cput0)
         return frag_res
+
+    def _solve_full_domain_frag(self, ifrag, eris, lno_pct_occ, lno_norb):
+        r''' LNOs and impurity problem of a full-domain fragment, as in the parent LNO
+        method, from the full-system integrals `eris`. '''
+        log = logger.new_logger(self)
+        nfrag = self.nfrag
+        loidx = self.frag_lolist[ifrag]
+        orbloc, lno_param = _frag_orbloc(self.lo_coeff, loidx, ifrag, self.lno_thresh,
+                                         lno_pct_occ, lno_norb)
+        lnofrag, frozen, uocc_loc, las_msg = self.make_las(eris, orbloc, self.lno_type,
+                                                           lno_param)
+        log.info('Fragment %d/%d  Domain: full system', ifrag+1, nfrag)
+        log.info('Fragment %d/%d  LAS: %s', ifrag+1, nfrag, las_msg)
+        res, msg = self.impurity_solve(self._scf, lnofrag, uocc_loc, eris, frozen=frozen)
+        log.info('Fragment %d/%d  Sol: %s', ifrag+1, nfrag, msg)
+        nocc = [int(np.count_nonzero(m > 1e-10)) for m in self._per_spin(self.mo_occ)]
+        nmo = [m.size for m in self._per_spin(self.mo_occ)]
+        info = dict(full_domain=True, natm_ao=self.mol.natm, natm_pao=self.mol.natm,
+                    nao=self.mol.nao_nr(), nocc=nocc, nvir=[n-o for n,o in zip(nmo,nocc)],
+                    las=las_msg)
+        return res, info
 
     def _domain_frag_lo(self, dl, dom):
         r''' The fragment LOs of `dom` in the AO basis of the domain object `dl`. '''
@@ -672,7 +746,20 @@ class DLNO:
 
     def _post_proc(self, frag_res, frag_wghtlist):
         super()._post_proc(frag_res, frag_wghtlist)
-        self.efrag_lmp2 = self.efrag_lmp2 * frag_wghtlist
+        efrag_lmp2 = np.array(self.efrag_lmp2, dtype=float)
+        nan = np.isnan(efrag_lmp2)
+        if nan.all():
+            # all fragments full-domain: share the full-system MP2 (of one unit) by the
+            # number of LOs, which reproduces it in e_corr_lmp2 for the units the fragments
+            # cover (e.g. one cell, or the whole supercell)
+            nlo = np.asarray([sum(len(x) for x in self._frag_lmo_idx(loidx))
+                              for loidx in self.frag_lolist], dtype=float)
+            efrag_lmp2 = self.get_full_mp2() * nlo / self._nlo_per_unit()
+        elif nan.any():
+            logger.warn(self, 'DLNO: the local MP2 of the %d full-domain fragments is not '
+                        'defined when other fragments are not; e_corr_lmp2 is NaN.',
+                        nan.sum())
+        self.efrag_lmp2 = efrag_lmp2 * frag_wghtlist
         self.efrag_lmp2_dist = self.efrag_lmp2_dist * frag_wghtlist
 
     @property

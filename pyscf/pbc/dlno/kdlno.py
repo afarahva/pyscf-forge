@@ -30,6 +30,9 @@ r''' Domain-based LNO with a k-point mean-field reference (KDLNO).
       supercell AO basis (`domain_basis = 'full'`), and their integrals are evaluated
       from the k-point DF integrals as in KLNO, so no extra density fitting is involved.
     - The fragment, local MP2 and LNO energies are per unit cell, as in KLNO.
+    - Fragments whose domain covers the whole supercell are solved exactly as in KLNO,
+      with its k-point integrals (`full_domain_fallback`): building the integrals of such a
+      domain in the supercell basis would cost a factor of ~Nk more than KLNO itself.
 '''
 
 import numpy as np
@@ -51,6 +54,7 @@ class KDLNO(DLNO):
     '''
     domain_basis = 'full'
     multipole_domain = 'bp'
+    full_domain_fallback = True
     _mol_multipole = None
 
     @property
@@ -86,6 +90,29 @@ class KDLNO(DLNO):
             from pyscf.pbc import tools
             return -tools.madelung(mf.cell, mf.kpt)
         return 0.
+
+    def _nlo_per_unit(self):
+        r''' Number of LOs per unit cell (the full-system energies are per cell). '''
+        return self.lo_coeff.shape[1] / float(len(self.kpts))
+
+    def get_full_mp2(self):
+        r''' KMP2 correlation energy per cell (computed with `pyscf.pbc.mp.KMP2` unless
+        `full_mp2` is given). '''
+        if self.full_mp2 is None:
+            from pyscf.pbc.mp import kmp2
+            nkpts = len(self.kpts)
+            frozen = self.frozen
+            if frozen is not None and not isinstance(frozen, (int, np.integer)):
+                raise NotImplementedError('KMP2 for the full-domain fallback needs an integer '
+                                          '`frozen`; set `full_mp2` instead.')
+            if frozen and frozen % nkpts:
+                raise NotImplementedError('frozen (%d) is not a multiple of nkpts' % frozen)
+            mmp = kmp2.KMP2(self._kscf, frozen=(frozen or 0)//nkpts)
+            mmp.verbose = self.verbose
+            mmp.kernel(with_t2=False)
+            self.full_mp2 = float(mmp.e_corr)
+            logger.info(self, 'KDLNO full-domain fallback: E_corr(KMP2) = %.15g', self.full_mp2)
+        return self.full_mp2
 
     def reset_domains(self):
         self._mol_multipole = None
