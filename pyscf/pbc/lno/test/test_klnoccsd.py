@@ -224,7 +224,8 @@ class ShiftedKmesh(unittest.TestCase):
             with lib.temporary_env(klno, DEBUG_BLKSIZE=True), \
                  lib.temporary_env(klnoccsd, DEBUG_BLKSIZE=True, FORCE_DFKCC=force_dfkcc), \
                  lib.temporary_env(ktools.K2SDF, naux=naux_pad):
-                mcc = self._klno(kmf, lno_thresh=[1e-5, 1e-6], force_outcore_ao2mo=True)[0]
+                mcc = self._klno(kmf, lno_thresh=[1e-5, 1e-6], force_outcore_ao2mo=True,
+                                 k_eris=False)[0]
             self.assertAlmostEqual(mcc.e_corr_pt2, ref[0], 8)
             self.assertAlmostEqual(mcc.e_corr_ccsd, ref[1], 8)
             self.assertAlmostEqual(mcc.e_corr_ccsd_t, ref[2], 8)
@@ -238,7 +239,7 @@ class ShiftedKmesh(unittest.TestCase):
         ref = [-0.0334853473, -0.0482735652, -0.0483090353]
         calls = []
         m1 = self._klno(kmf, smf, lno_thresh=[1e-5, 1e-6], force_outcore_ao2mo=True,
-                        run=lambda mcc: calls.append(kernel_counted(mcc)))[0]
+                        k_eris=False, run=lambda mcc: calls.append(kernel_counted(mcc)))[0]
         nfrag = m1.nfrag
         self.assertEqual(calls[0], {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
         self.assertAlmostEqual(m1.e_corr_pt2, ref[0], 8)

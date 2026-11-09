@@ -83,7 +83,8 @@ class KLNO(LNO):
             integrals: ~Nk/2 times less memory. For RPA/SOSEX LNOs the full-system drCCD
             is then solved with k-point symmetry (`pyscf.pbc.regpt2.kdriccd`). Used for
             '1h'/'1h' LNOs with in-core integrals and active orbitals made of whole bands;
-            otherwise the supercell integrals are used.
+            otherwise a RuntimeError is raised. Set k_eris = False to use the supercell
+            integrals instead.
             Default is True.
     '''
 
@@ -107,9 +108,7 @@ class KLNO(LNO):
         log = logger.new_logger(self)
 
         if self.k_eris:
-            eris = self.ao2mo_k()
-            if eris is not None:
-                return eris
+            return self.ao2mo_k()
 
         if self.with_df is None:
             log.error('DF is not found. Rerun KSCF with DF.')
@@ -148,7 +147,7 @@ class KLNO(LNO):
 
     def ao2mo_k(self):
         r''' k-point DF integrals of the active Bloch orbitals for the LNO density matrices
-        (see `k_eris`), or None where they do not apply.
+        (see `k_eris`). Raises RuntimeError where they do not apply.
         '''
         log = logger.new_logger(self)
         if list(self.lno_type) != ['1h','1h']:
@@ -171,9 +170,12 @@ class KLNO(LNO):
                 reason = None
                 if mem_df > min(mem_now*0.75, mem_now-2000):
                     reason = 'not enough memory'
+        # never fall back to the supercell integrals: they break translational symmetry when
+        # the active orbitals are not whole bands, and need ~Nq times more memory, so they
+        # cannot rescue 'not enough memory' either (outcore k-point integrals would, but are
+        # not implemented yet). Set k_eris = False to use the supercell integrals on purpose.
         if reason is not None:
-            log.info('k_eris: supercell integrals are used (%s)', reason)
-            return None
+            raise RuntimeError('k_eris: k-point integrals cannot be used (%s)' % reason)
 
         cput0 = (logger.process_clock(), logger.perf_counter())
         eris = _KLNODFKERIS(self.with_df, orbocc, orbvir, occ, vir, self.max_memory,
