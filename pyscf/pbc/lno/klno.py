@@ -441,34 +441,37 @@ class _KLNODFINCOREERIS_REAL(K2SDF):
         nocc, nvir, Naux = self.nocc, self.nvir, self.Naux_ibz
         nOcc = u.shape[1]
         M = (self.max_memory - lib.current_memory()[0])*1e6 / self.dsize
-        occblksize = min(nocc, max(1, int(np.floor(M*0.5/(nvir*Naux) - nOcc))))
+        # batching occ: OvLR/I take 2*nOcc*VX, each block holds the real and imag rows 2*[O]VX
+        occblksize = min(nocc, max(1, int(np.floor(M*0.5/(2*nvir*Naux) - nOcc))))
         if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
-        OvLR = np.empty((nOcc,nvir,Naux), dtype=np.float64)
-        OvLI = np.empty((nOcc,nvir,Naux), dtype=np.float64)
-        for iblk,(i0,i1) in enumerate(lib.prange(0,nocc,occblksize)):
+        OvLR = np.zeros((nOcc,nvir*Naux), dtype=np.float64)
+        OvLI = np.zeros((nOcc,nvir*Naux), dtype=np.float64)
+        for i0,i1 in lib.prange(0,nocc,occblksize):
             ovLR, ovLI = self.get_occ_blk(i0,i1)
-            if iblk == 0:
-                OvLR[:]  = lib.einsum('iax,iI->Iax', ovLR, u[i0:i1])
-                OvLI[:]  = lib.einsum('iax,iI->Iax', ovLI, u[i0:i1])
-            else:
-                OvLR[:] += lib.einsum('iax,iI->Iax', ovLR, u[i0:i1])
-                OvLI[:] += lib.einsum('iax,iI->Iax', ovLI, u[i0:i1])
+            # OvL[I,ax] += u[i,I] ovL[i,ax]: one GEMM on the (i,ax) view, accumulated in place
+            # (lib.einsum would make a transposed copy of the whole block)
+            lib.dot(u[i0:i1].T, ovLR.reshape(i1-i0,nvir*Naux), 1, OvLR, 1)
+            lib.dot(u[i0:i1].T, ovLI.reshape(i1-i0,nvir*Naux), 1, OvLI, 1)
             ovLR = ovLI = None
-        return OvLR, OvLI
+        return OvLR.reshape(nOcc,nvir,Naux), OvLI.reshape(nOcc,nvir,Naux)
 
     def xform_vir(self, u):
         assert( u.dtype == np.float64 )
         nocc, nvir, Naux = self.nocc, self.nvir, self.Naux_ibz
         nVir = u.shape[1]
         M = (self.max_memory - lib.current_memory()[0])*1e6 / self.dsize
-        occblksize = min(nocc, max(1, int(np.floor(M*0.5/(nvir*Naux) - nocc*nVir/float(nvir)))))
+        # batching occ: oVLR/I take 2*o*nVir*X, each block holds the real and imag rows 2*[O]VX
+        occblksize = min(nocc, max(1, int(np.floor(M*0.5/(2*nvir*Naux) - nocc*nVir/float(nvir)))))
         if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
         oVLR = np.empty((nocc,nVir,Naux), dtype=np.float64)
         oVLI = np.empty((nocc,nVir,Naux), dtype=np.float64)
         for i0,i1 in lib.prange(0,nocc,occblksize):
             ovLR, ovLI = self.get_occ_blk(i0,i1)
-            oVLR[i0:i1] = lib.einsum('iax,aA->iAx', ovLR, u)
-            oVLI[i0:i1] = lib.einsum('iax,aA->iAx', ovLI, u)
+            # oVL[i,A,x] = u[a,A] ovL[i,a,x]: one GEMM per occupied orbital, written in place
+            # (lib.einsum would make a transposed copy of the whole block)
+            for i in range(i0,i1):
+                lib.dot(u.T, ovLR[i-i0], 1, oVLR[i])
+                lib.dot(u.T, ovLI[i-i0], 1, oVLI[i])
             ovLR = ovLI = None
         return oVLR, oVLI
 
