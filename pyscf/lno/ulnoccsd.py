@@ -442,13 +442,16 @@ def get_fragment_energy(eris, t1, t2, prj):
     return lib.tag_array(e, spin_comp=np.array((0., 0.)))
 
 def get_maskact(frozen, nmo):
+    r''' Per-spin active masks for the per-spin `frozen` returned by `make_las` (an int,
+    as 0 for no frozen orbitals, or a list of indices). The frozen indices are returned as
+    arrays so that `pyscf.mp.ump2.get_frozen_mask` reads them per spin.
+    '''
+    frozen = list(frozen)
     maskact = [None,] * 2
     for s in range(2):
-        if len(frozen[s])>0:
-            frozen[s], maskact[s] = lnoccsd.get_maskact(frozen[s], nmo[s])
-        else:
-            #update for domain lno-ccsd
-            _, maskact[s] = lnoccsd.get_maskact(frozen[s], nmo[s])
+        frozen[s], maskact[s] = lnoccsd.get_maskact(frozen[s], nmo[s])
+        if isinstance(frozen[s], (int, np.integer)):
+            frozen[s] = np.arange(frozen[s], dtype=int)
     return frozen, maskact
 
 def fock_from_mo(mymf, s1e=None, force_exxdiv_none=True):

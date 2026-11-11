@@ -646,16 +646,21 @@ class LNO(lib.StreamObject):
 
         self._precompute()
 
-
-        frag_res = kernel(self, self.lo_coeff, self.frag_lolist,
-                          self.lno_type, self.lno_thresh,
-                          self.lno_pct_occ, self.lno_norb, eris=eris)
+        frag_res = self._solve_frags(eris=eris)
 
         self._post_proc(frag_res, frag_wghtlist)
 
         self._finalize()
 
         return self.e_corr
+
+    def _solve_frags(self, eris=None):
+        r''' Build the LNO active space of each fragment and solve its impurity problem
+        (see the module-level `kernel`). Returns the `impurity_solve` result of each
+        fragment. Domain-based LNO methods (`pyscf.dlno`) replace this step.
+        '''
+        return kernel(self, self.lo_coeff, self.frag_lolist, self.lno_type, self.lno_thresh,
+                      self.lno_pct_occ, self.lno_norb, eris=eris)
 
     def ao2mo(self):
         log = logger.new_logger(self)
