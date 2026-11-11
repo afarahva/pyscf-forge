@@ -36,8 +36,8 @@ r''' Domain-based local natural orbital (DLNO) methods.
          virtual  : the PAOs on the BP-domain atoms of these LMOs (extended domain);
          AO basis : the primary-domain atoms of these LMOs (extended primary domain), with
                     the occupied and virtual orbitals projected onto it, the AO basis and
-                    the DF auxiliary basis restricted to it (`domain_basis = 'local'`,
-                    molecules), or the full AO basis (`domain_basis = 'full'`).
+                    the DF auxiliary basis restricted to it (`domain_basis = 'local'`),
+                    or the full AO basis (`domain_basis = 'full'`).
        Both orbital spaces are semicanonicalized with the full-system Fock matrix.
     4. The LNOs of the fragment are built from the MP2 of the domain and its impurity
        problem is solved exactly as in the parent LNO method.
@@ -54,11 +54,10 @@ from functools import reduce
 
 import numpy as np
 
-from pyscf import lib, scf
+from pyscf import scf
 from pyscf.lib import logger
 
 from pyscf.lno.lno import _frag_orbloc
-from pyscf.dlno import domain as dom_mod
 from pyscf.dlno.domain import (ao_index_by_atom, get_bp_domain, make_pao,
                                get_primary_domain, domain_pao, bp_completeness,
                                project_mo, orth_against, lowdin, canonical,
@@ -80,7 +79,7 @@ class _DLNOData:
     r''' Domain data of the LMOs shared by all fragments (built by `build_domains`). '''
     def __init__(self):
         self.lmo = None           # per spin, LMO coefficients
-        self.fock = None          # per spin, AO Fock matrix (exxdiv=None for PBC)
+        self.fock = None          # per spin, AO Fock matrix
         self.pao = None           # per spin, PAO coefficients
         self.ao2pao = None        # per spin, AO -> PAO index (-1: discarded)
         self.lmo_bp = None        # per spin, LMO BP domains
@@ -122,19 +121,20 @@ class DLNO:
         multipole_domain : str
             Atoms whose AOs expand an LMO and its PAOs for the multipole moments:
             'primary' (its primary domain) or 'bp' (its BP domain, cheaper when the
-            primary domains are large, e.g. in solids). Default 'primary'.
+            primary domains are large). Default 'primary'.
         domain_basis : str
-            'local' (molecules only): the domain is solved in the AO and auxiliary basis
-            of its extended primary domain atoms. 'full': in the full AO basis.
+            'local': the domain is solved in the AO and auxiliary basis of its extended
+            primary domain atoms. 'full': in the full AO basis. Default 'local'.
         full_domain_fallback : bool
             Fragments whose virtual domain (PAO atoms) covers the whole system are solved
             as in the parent LNO method, from the full-system integrals (with all occupied
             orbitals). Their local MP2 energies are then taken from the full-system MP2
             (`full_mp2`): exact for `e_corr_lmp2` when all fragments are full-domain, else
-            left undefined (NaN). Default False (True for KDLNO).
+            left undefined (NaN). Default False.
         full_mp2 : float
-            Full-system MP2 correlation energy (per cell for KDLNO) for the fallback above;
-            computed when needed if not given.
+            Full-system MP2 correlation energy for the fallback above, supplied by the
+            caller (it is not computed here); without it the local MP2 of full-domain
+            fragments is NaN.
 
     Results (after `kernel`, weighted by `frag_wghtlist`):
         efrag_lmp2      : local MP2 fragment energies in their domains
@@ -185,17 +185,6 @@ class DLNO:
     def _pair_prefac(self):
         return 4. if self._nspin == 1 else 1.
 
-    # ------------------------------------------------------------------------------
-    # geometry hooks (overridden for PBC)
-    def _atom_distance(self):
-        return atom_distance(self.mol)
-
-    def _multipole_mol(self, atmlst, center_atom):
-        return fake_mol_by_atom(self.mol, atmlst)
-
-    def _pair_vector(self, ri, rj):
-        return rj - ri
-
     @property
     def _domain_basis_full(self):
         basis = self.domain_basis.lower()
@@ -207,19 +196,12 @@ class DLNO:
     # ------------------------------------------------------------------------------
     # Fock matrix
     def _parent_fock(self):
-        r''' Per spin AO Fock matrix of the mean-field reference (exxdiv=None for PBC). '''
+        r''' Per spin AO Fock matrix of the mean-field reference. '''
         if self._nspin == 1:
             from pyscf.lno.lnoccsd import fock_from_mo
             return [fock_from_mo(self._scf, s1e=self.s1e, force_exxdiv_none=True)]
         from pyscf.lno.ulnoccsd import fock_from_mo
         return list(fock_from_mo(self._scf, s1e=self.s1e))
-
-    def _occ_energy_shift(self):
-        r''' Shift of the occupied orbital energies from the Fock matrix of `_parent_fock`
-        to those of the mean-field reference (the Madelung shift for PBC with
-        exxdiv='ewald').
-        '''
-        return 0.
 
     # ------------------------------------------------------------------------------
     def dump_flags(self, verbose=None):
@@ -273,7 +255,7 @@ class DLNO:
         mol = self.mol
         s1e = self.s1e
         aoslices = mol.aoslice_by_atom()
-        dist = self._atom_distance()
+        dist = atom_distance(mol)
         nspin = self._nspin
 
         d = _DLNOData()
@@ -329,8 +311,7 @@ class DLNO:
                             e = d.pair_energy[t][s][j,i]
                         else:
                             mj = moments[t][j]
-                            e = pair_energy(mi, mj, self._pair_vector(mi.center, mj.center),
-                                            prefac)
+                            e = pair_energy(mi, mj, mj.center - mi.center, prefac)
                         d.pair_energy[s][t][i,j] = e
                         d.pair_mask[s][t][i,j] = True
         log.timer('DLNO pair energies', *cput1)
@@ -365,8 +346,7 @@ class DLNO:
         p = canonical(orth_against(lmo_i, p, s22), s22, self.pao_orth_thr)
         e_occ = np.dot(lmo_i[:,0].conj(), np.dot(f22, lmo_i[:,0])).real
         e_vir, p = semicanonicalize(p, f22)
-        pops = abs(dom_mod.atom_population(mol, d.lmo[s][:,i:i+1], s1e, aoslices)[:,0])
-        fmol = self._multipole_mol(pd, int(np.argmax(pops)))
+        fmol = fake_mol_by_atom(mol, pd)
         return LMOMoments(fmol, e_occ, lmo_i, e_vir, p, order=self.multipole_order)
 
     def _strong(self, d, s, i, t):
@@ -424,7 +404,6 @@ class DLNO:
             s21 = s1e[ao_idx]
             S = s1e[np.ix_(ao_idx, ao_idx)]
             F = [f[np.ix_(ao_idx, ao_idx)] for f in d.fock]
-        shift = self._occ_energy_shift()
         out = []
         for s in range(self._nspin):
             occ = d.lmo[s][:,dom.occ[s]]
@@ -442,7 +421,7 @@ class DLNO:
             p = canonical(p, S, self.pao_orth_thr)
             eo, occ = semicanonicalize(occ, F[s])
             ev, vir = semicanonicalize(p, F[s])
-            out.append((occ, eo + shift, vir, ev, loc))
+            out.append((occ, eo, vir, ev, loc))
         return ao_idx, S, out
 
     def _auxbasis(self):
@@ -550,10 +529,7 @@ class DLNO:
         dl._s1e, dl._h1e, dl._vhf = s1e, h1e, vhf
         dl.chkfile = None
         dl._ovL = dl._ovL_to_save = None
-        dl._rpa_eris = None
         dl._dlno = None
-        if hasattr(dl, 'k_eris'):
-            dl.k_eris = False
         return dl, (orbloc[0] if nspin == 1 else orbloc), df_cache
 
     def get_frag_lmp2(self, dl, eris, orbloc):
@@ -574,16 +550,6 @@ class DLNO:
         r''' Whether the fragment of domain `dom` falls back to the parent LNO method (see
         `full_domain_fallback`). '''
         return bool(self.full_domain_fallback) and len(dom.pao_atm) == self.mol.natm
-
-    def _nlo_per_unit(self):
-        r''' Number of LOs per unit of the full-system energies (the whole system). '''
-        return float(sum(x.shape[1] for x in self._per_spin(self.lo_coeff)))
-
-    def get_full_mp2(self):
-        r''' Full-system MP2 correlation energy (see `full_mp2`). '''
-        if self.full_mp2 is None:
-            raise NotImplementedError('Set `full_mp2` for the full-domain fallback.')
-        return self.full_mp2
 
     # ------------------------------------------------------------------------------
     # driver
@@ -607,7 +573,6 @@ class DLNO:
             self.build_domains()
         cput1 = log.timer('DLNO build domains', *cput1)
         doms = [self.frag_domain(loidx) for loidx in self.frag_lolist]
-        nspin = self._nspin
 
         full = np.asarray([self._full_domain(dom) for dom in doms], dtype=bool)
         self.frag_full_domain = full
@@ -748,17 +713,17 @@ class DLNO:
         super()._post_proc(frag_res, frag_wghtlist)
         efrag_lmp2 = np.array(self.efrag_lmp2, dtype=float)
         nan = np.isnan(efrag_lmp2)
-        if nan.all():
-            # all fragments full-domain: share the full-system MP2 (of one unit) by the
-            # number of LOs, which reproduces it in e_corr_lmp2 for the units the fragments
-            # cover (e.g. one cell, or the whole supercell)
+        if nan.all() and self.full_mp2 is not None:
+            # all fragments full-domain: share the full-system MP2 by the number of LOs,
+            # which reproduces it in e_corr_lmp2 when the fragments cover all LOs
             nlo = np.asarray([sum(len(x) for x in self._frag_lmo_idx(loidx))
                               for loidx in self.frag_lolist], dtype=float)
-            efrag_lmp2 = self.get_full_mp2() * nlo / self._nlo_per_unit()
+            nlo_tot = sum(x.shape[1] for x in self._per_spin(self.lo_coeff))
+            efrag_lmp2 = self.full_mp2 * nlo / nlo_tot
         elif nan.any():
             logger.warn(self, 'DLNO: the local MP2 of the %d full-domain fragments is not '
-                        'defined when other fragments are not; e_corr_lmp2 is NaN.',
-                        nan.sum())
+                        'defined (set `full_mp2` if all fragments are full-domain); '
+                        'e_corr_lmp2 is NaN.', nan.sum())
         self.efrag_lmp2 = efrag_lmp2 * frag_wghtlist
         self.efrag_lmp2_dist = self.efrag_lmp2_dist * frag_wghtlist
 

@@ -234,20 +234,14 @@ def semicanonicalize(orb, fock):
     e, u = scipy.linalg.eigh(f)
     return e, np.dot(orb, u)
 
-def fake_mol_by_atom(mol, atmlst, coords=None):
-    r''' A Mole holding the atoms `atmlst` of `mol` with the same basis (at the positions
-    `coords` in Bohr if given). The AOs are in the order of `ao_index_by_atom` when
-    `atmlst` is sorted. ECPs/pseudopotentials are dropped: the fake molecule is only used
-    for AO overlap, multipole and density-fitting integrals.
+def fake_mol_by_atom(mol, atmlst):
+    r''' A Mole holding the atoms `atmlst` of `mol` with the same basis. The AOs are in the
+    order of `ao_index_by_atom` when `atmlst` is sorted. ECPs/pseudopotentials are dropped:
+    the fake molecule is only used for AO overlap, multipole and density-fitting integrals.
     '''
-    if hasattr(mol, 'to_mol'):   # pbc Cell
-        mol = mol.to_mol()
     atmlst = np.asarray(atmlst, dtype=int)
     fake = mol.copy(deep=False)
-    if coords is None:
-        fake._atom = [mol._atom[a] for a in atmlst]
-    else:
-        fake._atom = [(mol._atom[a][0], list(coords[k])) for k,a in enumerate(atmlst)]
+    fake._atom = [mol._atom[a] for a in atmlst]
     fake._ecp = {}
     fake._pseudo = {}
     fake._ecpbas = np.zeros((0,8), dtype=np.int32)
@@ -256,24 +250,7 @@ def fake_mol_by_atom(mol, atmlst, coords=None):
     fake._built = True
     return fake
 
-def atom_distance(mol, lattice=None):
-    r''' Interatomic distances; minimum-image distances if `lattice` (rows are lattice
-    vectors in Bohr) is given.
-    '''
+def atom_distance(mol):
+    r''' Interatomic distances (Bohr). '''
     coords = mol.atom_coords()
-    d = coords[:,None,:] - coords[None,:,:]
-    if lattice is not None:
-        d = minimum_image(d, lattice)
-    return np.linalg.norm(d, axis=-1)
-
-def minimum_image(d, lattice):
-    r''' Minimum-image representatives of the displacement vectors `d` (..., 3). '''
-    lattice = np.asarray(lattice)
-    shape = d.shape
-    d = d.reshape(-1,3)
-    frac = np.linalg.solve(lattice.T, d.T).T
-    d = d - np.dot(np.round(frac), lattice)
-    shifts = np.asarray([(i,j,k) for i in (-1,0,1) for j in (-1,0,1) for k in (-1,0,1)])
-    cand = d[:,None,:] + np.dot(shifts, lattice)[None,:,:]
-    best = np.argmin(np.linalg.norm(cand, axis=-1), axis=1)
-    return cand[np.arange(d.shape[0]), best].reshape(shape)
+    return np.linalg.norm(coords[:,None,:] - coords[None,:,:], axis=-1)
