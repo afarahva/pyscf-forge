@@ -1,23 +1,28 @@
-''' Make MP2 rdm1 of different flavors
+''' MP2 density matrices for the LNOs of KLNO
+
+    Each kind of DF integrals of `pyscf.pbc.lno.klno` has its own routines:
+        real supercell orbitals      `*_real`      (`ovLR`, `ovLI`)
+        complex supercell orbitals   `*_complex`   (`ovL` of each q)
+        k-point Bloch orbitals       `*_k`         (`Lov[ki,ka]`; '1h' and '1p' only)
+    and `make_lo_rdm1` and `make_lo_rdm1_k` pick the routine for `lno_type`.
 
     Args:
         eris :
-            Provide access to the MO basis DF integral `ovL` through the following methods:
+            The supercell integrals provide `ovL` in the canonical MOs through
                 get_occ_blk(i0,i1) -> ([i0:i1]v|L)
                 get_vir_blk(a0,a1) -> (o[a0:a1]|L)
                 xform_occ(u)       -> einsum('iaL,iI->IaL', ovL, u)
                 xform_vir(u)       -> einsum('iaL,aA->iAL', ovL, u)
-        orbact_data : tuple
-            moeocc, moevir, uoccact, uviract = orbact_data
-            where
-                - `moeocc` and `moevir` are the MO energy for the occupied and virtual MOs
-                  used to obtain `ovL`
-                - `uoccact` and `uviract` are the overlap matrix between canonical and active
-                  orbitals, i.e., uoccact[i,I] = <i|I> and uviract[a,A] = <a|A>.
+            (real and imaginary parts for real orbitals; with q as first argument for
+            complex orbitals).
+        moeocc, moevir : np.ndarray
+            Energies of the canonical occupied and virtual MOs of the integrals.
+        u : np.ndarray
+            Overlap between the canonical and the localized orbitals of the fragment,
+            u[i,I] = <i|I> for '1h'/'2h' and u[a,A] = <a|A> for '1p'/'2p'.
         dm_type : str
             '1h'/'1p'/'2p' for occ and '1p'/'1h'/'2h' for vir.
 '''
-import sys
 import numpy as np
 from functools import reduce
 
@@ -30,51 +35,45 @@ from pyscf.lno.make_lno_rdm1 import (subspace_eigh, _mp2_rdm1_occblksize, _mp2_r
 from pyscf.pbc.lno.tools import zdotCNtoR
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_k2s_DEBUG_BLKSIZE', False)
+# upper bound (MB) on the blocks of ovL rows read at once when streaming ovL
+MAX_ROWBLK_MB = getattr(__config__, 'lno_base_make_rdm1_k2s_max_rowblk_mb', 4000)
 
+
+def make_lo_rdm1(eris, moeocc, moevir, uocc, uvir, lno_type):
+    r''' Occupied and virtual LNO density matrices from the supercell integrals, for
+    lno_type = [occ_type, vir_type] (a type that is None is not made). With real orbitals,
+    ['1h','1h'] and ['1p','1p'] make both from one set of amplitudes.
+    '''
+    occ_type, vir_type = lno_type
+    if occ_type == vir_type and eris.dtype == np.float64:
+        if occ_type == '1h':
+            return make_lo_rdm1_1h_real(eris, moeocc, moevir, uocc)
+        return make_lo_rdm1_1p_real(eris, moeocc, moevir, uvir)
+    dmoo = make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, occ_type) if occ_type else None
+    dmvv = make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, vir_type) if vir_type else None
+    return dmoo, dmvv
 
 def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type):
-    isreal = eris.dtype == np.float64
-    if dm_type == '1h':
-        if isreal:
-            dm = make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, uocc)
-        else:
-            dm = make_lo_rdm1_occ_1h_complex(eris, moeocc, moevir, uocc)
-    elif dm_type == '1p':
-        if isreal:
-            dm = make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, uvir)
-        else:
-            dm = make_lo_rdm1_occ_1p_complex(eris, moeocc, moevir, uvir)
-    elif dm_type == '2p':
-        if isreal:
-            dm = make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, uvir)
-        else:
-            dm = make_lo_rdm1_occ_2p_complex(eris, moeocc, moevir, uvir)
-    else:
+    # dm_type: (routine for real orbitals, routine for complex orbitals, u)
+    routines = {'1h': (make_lo_rdm1_occ_1h_real, make_lo_rdm1_occ_1h_complex, uocc),
+                '1p': (make_lo_rdm1_occ_1p_real, make_lo_rdm1_occ_1p_complex, uvir),
+                '2p': (make_lo_rdm1_occ_2p_real, make_lo_rdm1_occ_2p_complex, uvir)}
+    if dm_type not in routines:
         raise RuntimeError('Requested occ LNO type "%s" is unknown.' % dm_type)
-    dm = _check_dm_imag(eris, dm)
-    return dm
+    real_routine, complex_routine, u = routines[dm_type]
+    routine = real_routine if eris.dtype == np.float64 else complex_routine
+    return _check_dm_imag(eris, routine(eris, moeocc, moevir, u))
 
 def make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, dm_type):
-    isreal = eris.dtype == np.float64
-    if dm_type == '1p':
-        if isreal:
-            dm = make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, uvir)
-        else:
-            dm = make_lo_rdm1_vir_1p_complex(eris, moeocc, moevir, uvir)
-    elif dm_type == '1h':
-        if isreal:
-            dm = make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, uocc)
-        else:
-            dm = make_lo_rdm1_vir_1h_complex(eris, moeocc, moevir, uocc)
-    elif dm_type == '2h':
-        if isreal:
-            dm = make_lo_rdm1_vir_2h_real(eris, moeocc, moevir, uocc)
-        else:
-            dm = make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, uocc)
-    else:
+    # dm_type: (routine for real orbitals, routine for complex orbitals, u)
+    routines = {'1p': (make_lo_rdm1_vir_1p_real, make_lo_rdm1_vir_1p_complex, uvir),
+                '1h': (make_lo_rdm1_vir_1h_real, make_lo_rdm1_vir_1h_complex, uocc),
+                '2h': (make_lo_rdm1_vir_2h_real, make_lo_rdm1_vir_2h_complex, uocc)}
+    if dm_type not in routines:
         raise RuntimeError('Requested vir LNO type "%s" is unknown.' % dm_type)
-    dm = _check_dm_imag(eris, dm)
-    return dm
+    real_routine, complex_routine, u = routines[dm_type]
+    routine = real_routine if eris.dtype == np.float64 else complex_routine
+    return _check_dm_imag(eris, routine(eris, moeocc, moevir, u))
 
 ''' make lo rdm1 for real orbitals
 '''
@@ -86,60 +85,133 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
                 = 2 * \sum_{kab} t2(ikab).conj() * ( 2*t2(jkab) - t2(jkba) )
             dm(a,b)
                 = 2 * \sum_{ijc} t2(ijac) * ( 2*t2(ijbc) - t2(ijcb) ).conj()
+
+        These are the '1h' density matrices with every occupied orbital localized (the
+        occupied one with the opposite sign).
     '''
-    assert( with_occ or with_vir )
-
-    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
-    REAL = np.float64
-    dsize = 8
-
-    # determine occblksize
-    mem_avail = eris.max_memory - lib.current_memory()[0]
-    M = mem_avail * 0.7 * 1e6/dsize
-    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc,nvir,naux, 4, 3, M, dsize)
-    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
-    logger.debug1(eris, 'make_full_rdm1  :  nocc = %d  nvir = %d  naux = %d  occblksize = %d  '
-                  'peak mem = %.2f MB', nocc, nvir, naux, occblksize, mem_peak)
-    bufsize = occblksize*min(occblksize,nocc)*nvir**2
-    buf = np.empty(bufsize, dtype=REAL)
-
-    eov = moeocc[:,None] - moevir
-
-    dmoo = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None
-    dmvv = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None
-    for ibatch,(i0,i1) in enumerate(lib.prange(0,nocc,occblksize)):
-        ivLR, ivLI = eris.get_occ_blk(i0,i1)
-        ivLR = ivLR.reshape(-1,naux)
-        ivLI = ivLI.reshape(-1,naux)
-        eiv = eov[i0:i1]
-        for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
-            if jbatch == ibatch:
-                jvLR, jvLI = ivLR, ivLI
-                ejv = eiv
-            else:
-                jvLR, jvLI = eris.get_occ_blk(j0,j1)
-                jvLR = jvLR.reshape(-1,naux)
-                jvLI = jvLI.reshape(-1,naux)
-                ejv = eov[j0:j1]
-            denom = lib.direct_sum('ia+jb->iajb', eiv, ejv)
-            t2ijvv = np.ndarray((ivLR.shape[0],jvLR.shape[0]), dtype=REAL, buffer=buf)
-            zdotCNtoR(ivLR, ivLI, jvLR.T, jvLI.T, cR=t2ijvv)
-            t2ijvv = _make_t2(eris, t2ijvv.reshape(*denom.shape), denom)
-            jvLR = jvLI = None
-            denom = None
-            if with_occ:
-                dmoo[i0:i1,j0:j1]  = 4*lib.einsum('iakb,jakb->ij', t2ijvv, t2ijvv)
-                dmoo[i0:i1,j0:j1] -= 2*lib.einsum('iakb,jbka->ij', t2ijvv, t2ijvv)
-            if with_vir:
-                dmvv  = 4*lib.einsum('iajc,ibjc->ab', t2ijvv, t2ijvv)
-                dmvv -= 2*lib.einsum('iajc,icjb->ab', t2ijvv, t2ijvv)
-            t2ijvv = None
-        ivLR = ivLI = None
-    buf = None
-
+    dmoo, dmvv = make_lo_rdm1_1h_real(eris, moeocc, moevir, np.eye(eris.nocc),
+                                      with_occ=with_occ, with_vir=with_vir)
+    if with_occ:
+        dmoo = -dmoo
     return dmoo, dmvv
 
 def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
+    r''' Occupied MP2 density matrix with one localized hole (see `make_lo_rdm1_1h_real`)
+    '''
+    return make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_vir=False)[0]
+
+def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
+    r''' Virtual MP2 density matrix with one localized hole. Alone, the blocked algorithm
+    makes each amplitude once in two passes over `ovL` too, with less memory than
+    `make_lo_rdm1_1h_real`, which is used when both density matrices are needed.
+    '''
+    return _make_lo_rdm1_vir_1h_real_blocked(eris, moeocc, moevir, u)
+
+def make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
+    r''' Occupied and virtual MP2 density matrices with one localized hole
+
+        Math:
+            T(jcKa) = t2(Kjac),  K the semicanonical localized occupied orbitals
+            dm(i,j) = \sum_{aKb} -4 T(iaKb) T(jaKb) + 2 T(iaKb) T(jbKa)
+            dm(a,b) = \sum_{jcK} 2 T(jcKa) T(jcKb) - T(jcKa) T(jbKc) - T(jaKc) T(jcKb)
+                                 + 2 T(jaKc) T(jbKc)
+
+        For a block of K, all amplitudes T(j c K a) (nocc nvir^2 per K) are kept in memory.
+        They are made in one pass over `ovL` in blocks of occupied rows j (`get_occ_blk`),
+        after the pass of `xform_occ`, so each amplitude is made once and each K block reads
+        `ovL` twice, contiguously, for both density matrices. (The blocked algorithm
+        `_make_lo_rdm1_occ_1h_real_blocked`/`_make_lo_rdm1_vir_1h_real_blocked`, which needs
+        less memory but rebuilds the amplitudes of the occupied DM for every occupied block,
+        is used if one K of amplitudes does not fit.)
+
+        Args:
+            eris : ERI object
+                Provides `ovL` in the canonical MOs.
+            u : np.ndarray
+                Overlap between the canonical and localized occupied orbitals, i.e.,
+                    u(i,i') = <i|i'>
+
+        Returns:
+            dm_occ, dm_vir (None if not requested).
+    '''
+    assert( with_occ or with_vir )
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert(u.dtype == REAL)
+    nOcc = u.shape[1]
+
+    # Memory (in numbers): per K the amplitudes T (nocc nvir^2) and KvL (2 nvir naux); per
+    # occupied row of a block the integrals (2 nvir naux) and ~4 amplitude-sized temporaries.
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6/dsize
+    mem_K = nocc*nvir**2 + 2*nvir*naux
+    Occblksize = min(nOcc, int(np.floor(0.6*M / mem_K)))
+    if DEBUG_BLKSIZE: Occblksize = min(Occblksize, max(1,nOcc//2))
+    if Occblksize < 1:
+        logger.debug1(eris, 'make_lo_rdm1_1h :  not enough memory for the amplitudes of one '
+                      'localized occupied (%.2f MB); using the blocked algorithm',
+                      mem_K*dsize/1e6)
+        dmoo = dmvv = None
+        if with_occ:
+            dmoo = _make_lo_rdm1_occ_1h_real_blocked(eris, moeocc, moevir, u)
+        if with_vir:
+            dmvv = _make_lo_rdm1_vir_1h_real_blocked(eris, moeocc, moevir, u)
+        return dmoo, dmvv
+    mem_row = 2*nvir*naux + 4*nvir*Occblksize*nvir
+    occblksize = int(np.floor((M - Occblksize*mem_K) / mem_row))
+    occblksize = max(1, min(nocc, occblksize, int(MAX_ROWBLK_MB*1e6/dsize / mem_row)))
+    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
+    logger.debug1(eris, 'make_lo_rdm1_1h :  nocc = %d  nvir = %d  nOcc = %d  naux = %d  '
+                  'Occblksize = %d  occblksize = %d  peak mem = %.2f MB',
+                  nocc, nvir, nOcc, naux, Occblksize, occblksize,
+                  (Occblksize*mem_K + occblksize*mem_row)*dsize/1e6)
+
+    moeOcc, u = subspace_eigh(np.diag(moeocc), u)
+    eov = moeocc[:,None] - moevir
+    eOv = moeOcc[:,None] - moevir
+
+    dmoo = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None
+    dmvv = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None
+    for K0,K1 in lib.prange(0,nOcc,Occblksize):
+        nK = K1 - K0
+        KvLR, KvLI = eris.xform_occ(u[:,K0:K1])
+        KvLR = KvLR.reshape(nK*nvir,naux)
+        KvLI = KvLI.reshape(nK*nvir,naux)
+        eKv = eOv[K0:K1]
+        # T(j c K a) for all j, c, a: one pass over the rows j of ovL
+        T = np.empty((nocc,nvir,nK,nvir), dtype=REAL)
+        for j0,j1 in lib.prange(0,nocc,occblksize):
+            jcLR, jcLI = eris.get_occ_blk(j0,j1)
+            t2 = zdotCNtoR(jcLR.reshape(-1,naux), jcLI.reshape(-1,naux), KvLR.T, KvLI.T)
+            jcLR = jcLI = None
+            ejcKa = lib.direct_sum('jc+Ka->jcKa', eov[j0:j1], eKv)
+            T[j0:j1] = _make_t2(eris, t2.reshape(ejcKa.shape), ejcKa)
+            t2 = ejcKa = None
+        KvLR = KvLI = None
+        T2 = T.reshape(nocc,-1)
+        if with_occ:
+            dmoo -= 4 * lib.dot(T2, T2.T)
+        # the remaining contractions in blocks of rows j
+        for j0,j1 in lib.prange(0,nocc,occblksize):
+            Tj = T[j0:j1]
+            if with_occ:
+                Tjx = np.ascontiguousarray(Tj.transpose(0,3,2,1)).reshape(j1-j0,-1)
+                dmoo[:,j0:j1] += 2 * lib.dot(T2, Tjx.T)
+                Tjx = None
+            if with_vir:
+                dmvv += 2 * lib.einsum('jcKa,jcKb->ab', Tj, Tj)
+                tmp = lib.einsum('jcKa,jbKc->ab', Tj, Tj)
+                dmvv -= tmp
+                dmvv -= tmp.T
+                dmvv += 2 * lib.einsum('jaKc,jbKc->ab', Tj, Tj)
+                tmp = None
+            Tj = None
+        T = T2 = None
+
+    return dmoo, dmvv
+
+def _make_lo_rdm1_occ_1h_real_blocked(eris, moeocc, moevir, u):
     r''' Occupied MP2 density matrix with one localized hole
 
         Math:
@@ -218,6 +290,119 @@ def make_lo_rdm1_occ_1h_real(eris, moeocc, moevir, u):
     return dm
 
 def make_lo_rdm1_occ_1p_real(eris, moeocc, moevir, u):
+    r''' Occupied MP2 density matrix with one localized particle (see `make_lo_rdm1_1p_real`)
+    '''
+    return make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_vir=False)[0]
+
+def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
+    r''' Virtual MP2 density matrix with one localized particle (see `make_lo_rdm1_1p_real`)
+    '''
+    return make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=False)[1]
+
+def make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
+    r''' Occupied and virtual MP2 density matrices with one localized particle
+
+        Math:
+            X(iAkb) = t2(ikAb),  A the semicanonical localized virtuals
+            dm(i,j) = \sum_{Akb} -2 X(iAkb) X(jAkb) + X(iAkb) X(kAjb) + X(kAib) X(jAkb)
+                                 - 2 X(kAib) X(kAjb)
+            dm(a,b) = \sum_{iAk} 4 X(iAka) X(iAkb) - 2 X(iAka) X(kAib)
+
+        For a block of A, all amplitudes X(i A k b) (nocc^2 nvir per A) are kept in memory.
+        They are made in one pass over `ovL` in blocks of occupied rows (`get_occ_blk`),
+        after the pass of `xform_vir`, so each amplitude is made once and each A block
+        reads `ovL` twice, contiguously, for both density matrices. (The blocked algorithm
+        `_make_lo_rdm1_occ_1p_real_blocked`/`_make_lo_rdm1_vir_1p_real_blocked`, which needs
+        less memory, rebuilds the amplitudes for every virtual block and reads `ovL` by
+        virtual columns; it is used only if one A of amplitudes does not fit.)
+
+        Args:
+            eris : ERI object
+                Provides `ovL` in the canonical MOs.
+            u : np.ndarray
+                Overlap between the canonical and localized virtual orbitals, i.e.,
+                    u(a,a') = <a|a'>
+
+        Returns:
+            dm_occ, dm_vir (None if not requested).
+    '''
+    assert( with_occ or with_vir )
+    nocc, nvir, naux = eris.nocc, eris.nvir, eris.Naux_ibz
+    REAL = np.float64
+    dsize = 8
+    assert(u.dtype == REAL)
+    nVir = u.shape[1]
+
+    # Memory (in numbers): per A the amplitudes X (nocc^2 nvir) and oAL (2 nocc naux); per
+    # occupied row of a block the integrals (2 nvir naux) and ~4 amplitude-sized temporaries.
+    # The row blocks are also bounded so that streaming `ovL` does not take the memory the OS
+    # page cache could use to hold it.
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    M = mem_avail * 0.7 * 1e6/dsize
+    mem_A = nocc**2*nvir + 2*nocc*naux
+    Virblksize = min(nVir, int(np.floor(0.6*M / mem_A)))
+    if DEBUG_BLKSIZE: Virblksize = min(Virblksize, max(1,nVir//2))
+    if Virblksize < 1:
+        logger.debug1(eris, 'make_lo_rdm1_1p :  not enough memory for the amplitudes of one '
+                      'localized virtual (%.2f MB); using the blocked algorithm',
+                      mem_A*dsize/1e6)
+        dmoo = dmvv = None
+        if with_occ:
+            dmoo = _make_lo_rdm1_occ_1p_real_blocked(eris, moeocc, moevir, u)
+        if with_vir:
+            dmvv = _make_lo_rdm1_vir_1p_real_blocked(eris, moeocc, moevir, u)
+        return dmoo, dmvv
+    mem_row = 2*nvir*naux + 4*nocc*Virblksize*nvir
+    occblksize = int(np.floor((M - Virblksize*mem_A) / mem_row))
+    occblksize = max(1, min(nocc, occblksize, int(MAX_ROWBLK_MB*1e6/dsize / mem_row)))
+    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
+    logger.debug1(eris, 'make_lo_rdm1_1p :  nocc = %d  nvir = %d  nVir = %d  naux = %d  '
+                  'Virblksize = %d  occblksize = %d  peak mem = %.2f MB',
+                  nocc, nvir, nVir, naux, Virblksize, occblksize,
+                  (Virblksize*mem_A + occblksize*mem_row)*dsize/1e6)
+
+    moeVir, u = subspace_eigh(np.diag(moevir), u)
+    eov = moeocc[:,None] - moevir
+    eoV = moeocc[:,None] - moeVir
+
+    dmoo = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None
+    dmvv = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None
+    for A0,A1 in lib.prange(0,nVir,Virblksize):
+        nA = A1 - A0
+        oALR, oALI = eris.xform_vir(u[:,A0:A1])
+        oALR = oALR.reshape(nocc*nA,naux)
+        oALI = oALI.reshape(nocc*nA,naux)
+        eoA = eoV[:,A0:A1]
+        # X(i A k b) for all k, b: one pass over the rows k of ovL
+        X = np.empty((nocc,nA,nocc,nvir), dtype=REAL)
+        for k0,k1 in lib.prange(0,nocc,occblksize):
+            kbLR, kbLI = eris.get_occ_blk(k0,k1)
+            t2 = zdotCNtoR(oALR, oALI, kbLR.reshape(-1,naux).T, kbLI.reshape(-1,naux).T)
+            kbLR = kbLI = None
+            eoAkb = lib.direct_sum('iA+kb->iAkb', eoA, eov[k0:k1])
+            X[:,:,k0:k1] = _make_t2(eris, t2.reshape(eoAkb.shape), eoAkb)
+            t2 = eoAkb = None
+        oALR = oALI = None
+        # contractions, in blocks of the third index k: Xs = X(i A k b) and Xr = X(k A i b)
+        for k0,k1 in lib.prange(0,nocc,occblksize):
+            Xs = np.ascontiguousarray(X[:,:,k0:k1])
+            Xr = X[k0:k1]
+            if with_occ:
+                dmoo -= 2 * lib.einsum('iAkb,jAkb->ij', Xs, Xs)
+                tmp = lib.einsum('iAkb,kAjb->ij', Xs, Xr)
+                dmoo += tmp
+                dmoo += tmp.T
+                dmoo -= 2 * lib.einsum('kAib,kAjb->ij', Xr, Xr)
+                tmp = None
+            if with_vir:
+                dmvv += 4 * lib.einsum('iAka,iAkb->ab', Xs, Xs)
+                dmvv -= 2 * lib.einsum('iAka,kAib->ab', Xs, Xr)
+            Xs = Xr = None
+        X = None
+
+    return dmoo, dmvv
+
+def _make_lo_rdm1_occ_1p_real_blocked(eris, moeocc, moevir, u):
     r''' Occupied MP2 density matrix with one localized particle
 
         Math:
@@ -349,7 +534,7 @@ def make_lo_rdm1_occ_2p_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
+def _make_lo_rdm1_vir_1p_real_blocked(eris, moeocc, moevir, u):
     r''' Virtual MP2 density matrix with one localized particle
 
         Math:
@@ -377,7 +562,8 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
     logger.debug1(eris, 'make_lo_rdm1_vir_1p :  nocc = %d  nvir = %d  nVir = %d  naux = %d  '
                   'virblksize = %d  peak mem = %.2f MB',
                   nocc, nvir, nVir, naux, virblksize, mem_peak)
-    bufsize = nvir*min(nvir,virblksize)*nocc**2
+    # t2oAoa/t2oAob are (nocc, <=virblksize of nVir, nocc, <=virblksize of nvir)
+    bufsize = min(nVir,virblksize)*min(nvir,virblksize)*nocc**2
     buf1 = np.empty(bufsize, dtype=REAL)
     buf2 = np.empty(bufsize, dtype=REAL)
 
@@ -428,8 +614,8 @@ def make_lo_rdm1_vir_1p_real(eris, moeocc, moevir, u):
 
     return dm
 
-def make_lo_rdm1_vir_1h_real(eris, moeocc, moevir, u):
-    r''' Occupied MP2 density matrix with one localized hole
+def _make_lo_rdm1_vir_1h_real_blocked(eris, moeocc, moevir, u):
+    r''' Virtual MP2 density matrix with one localized hole
 
         Math:
             dm(a,b)
@@ -935,13 +1121,21 @@ def make_lo_rdm1_vir_2h_complex(eris, moeocc, moevir, u):
 
 ''' make lo rdm1 from k-point integrals
 '''
-def make_lo_rdm1_1h_occ_k(eris, u):
-    r''' Occupied '1h' MP2 density matrix from k-point integrals (see `make_lo_rdm1_1h_k`). '''
-    return make_lo_rdm1_1h_k(eris, u, with_vir=False)[0]
-
-def make_lo_rdm1_1h_vir_k(eris, u):
-    r''' Virtual '1h' MP2 density matrix from k-point integrals (see `make_lo_rdm1_1h_k`). '''
-    return make_lo_rdm1_1h_k(eris, u, with_occ=False)[1]
+def make_lo_rdm1_k(eris, uocc, uvir, lno_type):
+    r''' Occupied and virtual '1h'/'1p' LNO density matrices from the k-point integrals,
+    for lno_type = [occ_type, vir_type] (a type that is None is not made). The same type
+    for both makes both from one set of amplitudes.
+    '''
+    def make(dm_type, with_occ, with_vir):
+        if dm_type == '1h':
+            return make_lo_rdm1_1h_k(eris, uocc, with_occ=with_occ, with_vir=with_vir)
+        return make_lo_rdm1_1p_k(eris, uvir, with_occ=with_occ, with_vir=with_vir)
+    occ_type, vir_type = lno_type
+    if occ_type == vir_type:
+        return make(occ_type, True, True)
+    dmoo = make(occ_type, True, False)[0] if occ_type else None
+    dmvv = make(vir_type, False, True)[1] if vir_type else None
+    return dmoo, dmvv
 
 def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
     r''' Occupied and virtual MP2 density matrices with one localized hole, from the k-point
@@ -1050,9 +1244,114 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
         dmvv = _check_dm_imag(eris, reduce(np.dot, (eris.Wvir.T.conj(), dmvv, eris.Wvir)))
     return dmoo, dmvv
 
-def conj_(a):
-    # in-place conjugate
-    np.conj(a, out=a)
+def make_lo_rdm1_1p_k(eris, u, with_occ=True, with_vir=True):
+    r''' Occupied and virtual MP2 density matrices with one localized particle, from the
+    k-point DF integrals of the Bloch orbitals (`pyscf.pbc.lno.klno._KLNODFKERIS`). This is
+    `make_lo_rdm1_1h_k` with the roles of occupied and virtual orbitals exchanged.
+
+        Math:
+            dm(i,j) = \sum_{kAb} t2(ikAb).conj() * ( t2(kjAb) - 2*t2(jkAb) )
+                               + t2(kiAb).conj() * ( t2(jkAb) - 2*t2(kjAb) )
+            dm(a,b) = \sum_{ikA} t2(ikAa) * ( 4*t2(ikAb) - 2*t2(kiAb) ).conj()
+            t2(ikAb) = (iA|kb).conj() / (e_i + e_k - e_A - e_b)
+
+        as `make_lo_rdm1_1p_real`, with i, k, b Bloch orbitals and
+        A = \sum_{ka} |k a> C(k a,A) the semicanonical fragment virtuals. Momentum
+        conservation fixes k_A = k_i + k_k - k_b, so each block of (iA|kb) needs the integrals
+        of one momentum transfer q = k_A - k_i = k_k - k_b only.
+
+        Both density matrices are sums over k, so the amplitudes are made for a block of A
+        and one k_k at a time, as the slabs
+            t_ik = t2(i k A b),  t_ki = t2(k i A b)     (k in k_k; i, b in all k)
+        which hold every amplitude the density matrices need for those k. Each amplitude is
+        thus made twice (in t_ik of k_k and in t_ki of k_i), but no amplitude array is
+        larger than (nA, Nk*nocc, nocc, Nk*nvir).
+
+        Args:
+            eris : _KLNODFKERIS
+                Provides the k-point integrals `Lov`, Bloch orbital energies
+                `mo_energy_occ`/`mo_energy_vir` (Nk,nocc)/(Nk,nvir), and the overlaps
+                `Wocc`/`Wvir` between the Bloch and the supercell canonical orbitals.
+            u : np.ndarray
+                Overlap between the supercell canonical and localized virtual orbitals,
+                i.e., u(a,a') = <a|a'>
+
+        Returns:
+            dm_occ, dm_vir in the supercell canonical orbitals (None if not requested).
+    '''
+    Lov, kconserv = eris.Lov, eris.kconserv
+    eo, ev = eris.mo_energy_occ, eris.mo_energy_vir
+    nkpts, nocc = eo.shape
+    nvir = ev.shape[1]
+    nko, nkv = nkpts*nocc, nkpts*nvir
+    naux = max(L.shape[0] for L in Lov.ravel())
+    COMPLEX = np.complex128
+    dsize = 16
+
+    # semicanonical fragment virtuals in the Bloch basis
+    eA, cA = subspace_eigh(np.diag(ev.ravel()), np.dot(eris.Wvir, u))
+    cA = cA.reshape(nkpts,nvir,-1)
+    nVir = eA.size
+
+    # determine Virblksize: per A, the (i A|L) of all q and ~7 slabs (t_ik, t_ki,
+    # denominators, temporaries); fixed, the density matrices and ibL
+    mem_avail = eris.max_memory - lib.current_memory()[0]
+    mem_fix = (nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
+    mem_A = (nkpts*naux*nko + 7*nko*nocc*nkv) * dsize/1e6
+    Virblksize = max(1, min(nVir, int(np.floor((mem_avail*0.7 - mem_fix) / mem_A))))
+    if DEBUG_BLKSIZE: Virblksize = max(1,nVir//2)
+    logger.debug1(eris, 'make_lo_rdm1_1p_k :  nkpts = %d  nocc = %d  nvir = %d  nVir = %d  '
+                  'naux = %d  Virblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nVir,
+                  naux, Virblksize, mem_fix + Virblksize*mem_A)
+
+    # ibL[q] = (i b|L) of all k_i, with k_b = k_i - q: (naux_q, Nk, nocc, nvir)
+    kis = np.arange(nkpts)
+    ibL = [np.stack([Lov[ki,kconserv[ki,q,0]] for ki in kis], axis=1) for q in range(nkpts)]
+
+    dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
+    dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
+    eov, evv = eo.ravel(), ev.ravel()
+    for A0,A1 in lib.prange(0,nVir,Virblksize):
+        nA = A1 - A0
+        eAv = eA[A0:A1]
+        # iAL[q] = (i A|L) of all k_i, with k_A = k_i + q: (naux_q, Nk, nocc, nA)
+        iAL = [np.stack([lib.einsum('Lia,aA->LiA', Lov[ki,kconserv[ki,0,q]],
+                                    cA[kconserv[ki,0,q],:,A0:A1])
+                         for ki in kis], axis=1) for q in range(nkpts)]
+        t_ik = np.empty((nA,nkpts,nocc,nocc,nkpts,nvir), dtype=COMPLEX)
+        t_ki = np.empty((nA,nocc,nkpts,nocc,nkpts,nvir), dtype=COMPLEX)
+        for kk in range(nkpts):
+            # (i A|k b): q = k_k - k_b, one product per k_b for all k_i
+            for kb in range(nkpts):
+                t_ik[:,:,:,:,kb] = lib.einsum('LmiA,Lkb->Amikb', iAL[kconserv[kk,kb,0]],
+                                              Lov[kk,kb])
+            # (k A|i b): q = k_i - k_b, one product per q for all k_i (and k_b = k_i - q)
+            for q in range(nkpts):
+                t_ki[:,:,kis,:,kconserv[kis,q,0]] = lib.einsum('LkA,Lmib->mAkib',
+                                                               iAL[q][:,kk], ibL[q])
+            # amplitudes in place
+            tik = _make_t2(eris, t_ik.reshape(nA,nko,nocc,nkv),
+                           lib.direct_sum('i+k-A-b->Aikb', eov, eo[kk], eAv, evv))
+            tki = _make_t2(eris, t_ki.reshape(nA,nocc,nko,nkv),
+                           lib.direct_sum('k+i-A-b->Akib', eo[kk], eov, eAv, evv))
+            if with_occ:
+                x = tki.transpose(0,2,1,3) - 2*tik
+                dmoo += lib.einsum('Aikb,Ajkb->ij', tik.conj(), x)
+                x = tik.transpose(0,2,1,3) - 2*tki
+                dmoo += lib.einsum('Akib,Akjb->ij', tki.conj(), x)
+            if with_vir:
+                x = 4*tik - 2*tki.transpose(0,2,1,3)
+                dmvv += lib.einsum('Aika,Aikb->ab', tik, x.conj())
+            x = tik = tki = None
+        t_ik = t_ki = iAL = None
+    ibL = None
+
+    # Bloch -> supercell canonical orbitals
+    if with_occ:
+        dmoo = _check_dm_imag(eris, reduce(np.dot, (eris.Wocc.T.conj(), dmoo, eris.Wocc)))
+    if with_vir:
+        dmvv = _check_dm_imag(eris, reduce(np.dot, (eris.Wvir.T.conj(), dmvv, eris.Wvir)))
+    return dmoo, dmvv
 
 def _check_dm_imag(eris, dm):
     if eris.dtype_eri == np.float64:

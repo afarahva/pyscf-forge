@@ -194,9 +194,6 @@ class WaterDimerRPA(unittest.TestCase):
         mlno.pt2_amp = 'ccsd'
         with self.assertRaises(ValueError):
             mlno._pt2_amp
-        mlno.lno_amp, mlno.pt2_amp, mlno.prune_lno_basis = 'mp2', 'sosex', True
-        with self.assertRaises(NotImplementedError):
-            mlno._pt2_amp
         # no RPA/SOSEX amplitudes for ULNO
         umlno = ULNOCCSD(scf.UHF(self.mol).density_fit(), [self.lo_coeff]*2, [[[0],[]]])
         umlno.lno_amp = 'rpa'

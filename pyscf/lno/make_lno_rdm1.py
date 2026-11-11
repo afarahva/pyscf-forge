@@ -35,7 +35,6 @@
         dm_type : str
             '1h'/'1p'/'2p' for occ and '1p'/'1h'/'2h' for vir.
 '''
-import sys
 import numpy as np
 from functools import reduce
 
@@ -52,13 +51,24 @@ def _make_t2(eris, num, denom, conj=True):
     num = (ia|jb), computed in place of `num` and damped by 1 - exp(kappa * denom) for
     kappa-MP2 if `eris` carries `kappa` (see `pyscf.lno.lno._DressedERIS`).
     '''
-    t2 = np.conj(num, out=num) if conj else num
+    t2 = num
+    if conj and np.iscomplexobj(num):   # conj of real data would be a (slow) copy in place
+        np.conj(num, out=num)
     t2 /= denom
     kappa = getattr(eris, 'kappa', None)
     if kappa is not None:
         t2 *= kappa_factor(denom, kappa)
     return t2
 
+
+def make_lo_rdm1(eris, moeocc, moevir, uocc, uvir, lno_type):
+    r''' Occupied and virtual LNO density matrices for lno_type = [occ_type, vir_type]
+    (a type that is None is not made).
+    '''
+    occ_type, vir_type = lno_type
+    dmoo = make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, occ_type) if occ_type else None
+    dmvv = make_lo_rdm1_vir(eris, moeocc, moevir, uocc, uvir, vir_type) if vir_type else None
+    return dmoo, dmvv
 
 def make_lo_rdm1_occ(eris, moeocc, moevir, uocc, uvir, dm_type):
     if dm_type == '1h':
@@ -124,46 +134,8 @@ def make_full_rdm1(eris, moeocc, moevir, with_occ=True, with_vir=True):
                 = 2 * \sum_{ijc} t2(ijac) * ( 2*t2(ijbc) - t2(ijcb) ).conj()
     '''
     assert( with_occ or with_vir )
-
-    nocc, nvir, naux = eris.nocc, eris.nvir, eris.naux
-    dtype = eris.dtype
-    dsize = eris.dsize
-
-    # determine occblksize
-    mem_avail = eris.max_memory - lib.current_memory()[0]
-    M = mem_avail * 0.7 * 1e6/dsize
-    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc,nvir,naux, 2, 3, M, dsize)
-    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
-    logger.debug1(eris, 'make_full_rdm1  :  nocc = %d  nvir = %d  naux = %d  occblksize = %d  '
-                  'peak mem = %.2f MB', nocc, nvir, naux, occblksize, mem_peak)
-
-    eov = moeocc[:,None] - moevir
-
-    dmoo = np.zeros((nocc,nocc), dtype=dtype) if with_occ else None
-    dmvv = np.zeros((nvir,nvir), dtype=dtype) if with_vir else None
-    for ibatch,(i0,i1) in enumerate(lib.prange(0,nocc,occblksize)):
-        ivL = eris.get_occ_blk(i0,i1)
-        eiv = eov[i0:i1]
-        for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
-            if jbatch == ibatch:
-                jvL = ivL
-                ejv = eiv
-            else:
-                jvL = eris.get_occ_blk(j0,j1)
-                ejv = eov[j0:j1]
-            denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), denom)
-            jvL = None
-            denom = None
-            if with_occ:
-                dmoo[i0:i1,j0:j1]  = 4*lib.einsum('ikab,jkab->ij', np.conj(t2ijvv), t2ijvv)
-                dmoo[i0:i1,j0:j1] -= 2*lib.einsum('ikab,jkba->ij', np.conj(t2ijvv), t2ijvv)
-            if with_vir:
-                dmvv  = 4*lib.einsum('ijac,ijbc->ab', t2ijvv, np.conj(t2ijvv))
-                dmvv -= 2*lib.einsum('ijac,ijcb->ab', t2ijvv, np.conj(t2ijvv))
-            t2ijvv = None
-        ivL = None
-
+    dmoo = make_full_rdm1_occ(eris, moeocc, moevir) if with_occ else None
+    dmvv = make_full_rdm1_vir(eris, moeocc, moevir) if with_vir else None
     return dmoo, dmvv
 
 def make_full_rdm1_occ(eris, moeocc, moevir):
@@ -172,42 +144,10 @@ def make_full_rdm1_occ(eris, moeocc, moevir):
         Math:
             dm(i,j)
                 = 2 * \sum_{kab} t2(ikab) ( 2*t2(jkab) - t2(jkba) )
+
+        This is minus the '1h' density matrix with every occupied orbital localized.
     '''
-    nocc, nvir, naux = eris.nocc, eris.nvir, eris.naux
-    dtype = eris.dtype
-    dsize = eris.dsize
-
-    # determine occblksize
-    mem_avail = eris.max_memory - lib.current_memory()[0]
-    M = mem_avail * 0.7 * 1e6/dsize
-    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc,nvir,naux, 2, 3, M, dsize)
-    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
-    logger.debug1(eris, 'make_full_rdm1_occ  :  nocc = %d  nvir = %d  naux = %d  occblksize = %d  '
-                  'peak mem = %.2f MB', nocc, nvir, naux, occblksize, mem_peak)
-
-    eov = moeocc[:,None] - moevir
-
-    dm = np.zeros((nocc,nocc), dtype=dtype)
-    for ibatch,(i0,i1) in enumerate(lib.prange(0,nocc,occblksize)):
-        ivL = eris.get_occ_blk(i0,i1)
-        eiv = eov[i0:i1]
-        for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
-            if jbatch == ibatch:
-                jvL = ivL
-                ejv = eiv
-            else:
-                jvL = eris.get_occ_blk(j0,j1)
-                ejv = eov[j0:j1]
-            denom = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), denom)
-            jvL = None
-            denom = None
-            dm[i0:i1,j0:j1]  = 4*lib.einsum('ikab,jkab->ij', np.conj(t2ijvv), t2ijvv)
-            dm[i0:i1,j0:j1] -= 2*lib.einsum('ikab,jkba->ij', np.conj(t2ijvv), t2ijvv)
-            t2ijvv = None
-        ivL = None
-
-    return dm
+    return -make_lo_rdm1_occ_1h(eris, moeocc, moevir, np.eye(eris.nocc))
 
 def make_full_rdm1_vir(eris, moeocc, moevir):
     r''' Virtual MP2 density matrix
@@ -215,44 +155,10 @@ def make_full_rdm1_vir(eris, moeocc, moevir):
         Math:
             dm(a,b)
                 = 2 * \sum_{ijc} t2(ijac) ( 2*t2(ijbc) - t2(ijcb) )
+
+        This is the '1h' density matrix with every occupied orbital localized.
     '''
-    nocc, nvir, naux = eris.nocc, eris.nvir, eris.naux
-    dtype = eris.dtype
-    dsize = eris.dsize
-
-    # determine occblksize
-    mem_avail = eris.max_memory - lib.current_memory()[0]
-    M = mem_avail * 0.7 * 1e6/dsize
-    occblksize, mem_peak = _mp2_rdm1_occblksize(nocc,nvir,naux, 2, 3, M, dsize)
-    if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
-    logger.debug1(eris, 'make_full_rdm1_vir  :  nocc = %d  nvir = %d  naux = %d  occblksize = %d  '
-                  'peak mem = %.2f MB', nocc, nvir, naux, occblksize, mem_peak)
-
-    eov = moeocc[:,None] - moevir
-
-    dm = np.zeros((nvir,nvir), dtype=dtype)
-    for ibatch,(i0,i1) in enumerate(lib.prange(0,nocc,occblksize)):
-        ivL = eris.get_occ_blk(i0,i1)
-        eiv = eov[i0:i1]
-        for jbatch,(j0,j1) in enumerate(lib.prange(0,nocc,occblksize)):
-            if jbatch == ibatch:
-                jvL = ivL
-                ejv = eiv
-            else:
-                jvL = eris.get_occ_blk(j0,j1)
-                ejv = eov[j0:j1]
-            eijvv = lib.direct_sum('ia+jb->ijab', eiv, ejv)
-            t2ijvv = _make_t2(eris, lib.einsum('iax,jbx->ijab', ivL, jvL), eijvv)
-            jvL = None
-            eijvv = None
-
-            dm  = 4*lib.einsum('ijac,ijbc->ab', t2ijvv, np.conj(t2ijvv))
-            dm -= 2*lib.einsum('ijac,ijcb->ab', t2ijvv, np.conj(t2ijvv))
-
-            t2ijvv = None
-        ivL = None
-
-    return dm
+    return make_lo_rdm1_vir_1h(eris, moeocc, moevir, np.eye(eris.nocc))
 
 def make_lo_rdm1_occ_1h(eris, moeocc, moevir, u):
     r''' Occupied MP2 density matrix with one localized hole

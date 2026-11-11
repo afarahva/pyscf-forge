@@ -201,6 +201,43 @@ class ShiftedKmesh(unittest.TestCase):
         self.assertAlmostEqual(kmcc.e_corr_ccsd, mcc.e_corr_ccsd/nkpts, 7)
         self.assertAlmostEqual(kmcc.e_corr_ccsd_t, mcc.e_corr_ccsd_t/nkpts, 7)
 
+    def test_klno_1p_k_eris(self):
+        ''' '1h'/'1p' LNO density matrices from the k-point integrals (k_eris) against those
+            from the supercell integrals, for real and complex orbitals; and KLNO-CCSD with
+            '1p' LNOs from either.
+        '''
+        from functools import reduce
+        from pyscf.lno.lno import projection_construction
+        from pyscf.pbc.lno.klno import _KLNODFKERIS
+        for center in ([0.25,0,0], [0.1,0,0]):     # real, complex orbitals
+            kmf = self._kmf([2,1,1], center)
+            mcc, lo_coeff, frag_lolist = self._klno(kmf, ccsd_t=False, run=lambda m: None)
+            orbocc, orbvir = mcc.split_mo_coeff()[1:3]
+            moeocc, moevir = mcc.split_mo_energy()[1:3]
+            orbloc = lo_coeff[:,frag_lolist[0]]
+            uocc, uvir = [projection_construction(reduce(np.dot, (orbloc.T.conj(), mcc.s1e, orb)),
+                                                  mcc.lo_proj_thresh,
+                                                  mcc.lo_proj_thresh_active)[0]
+                          for orb in (orbocc, orbvir)]
+            for lno_type in (['1p','1p'], ['1h','1p'], ['1p','1h'], ['1h','1h']):
+                mcc.lno_type = lno_type
+                dms = []
+                for k_eris in (True, False):
+                    mcc.k_eris = k_eris
+                    eris = mcc.ao2mo()
+                    self.assertEqual(isinstance(eris, _KLNODFKERIS), k_eris)
+                    dms.append(mcc.make_lo_rdm1(eris, moeocc, moevir, uocc, uvir, lno_type))
+                for dm_k, dm_sc in zip(*dms):
+                    self.assertAlmostEqual(abs(dm_k - dm_sc).max(), 0, 12)
+
+        kmf = self._kmf([2,1,1], [0.25,0,0])
+        smf = k2s_scf(kmf)
+        kmcc, smcc = [self._klno(kmf, smf, ccsd_t=False, lno_type=['1p','1p'],
+                                 lno_thresh=[1e-5,1e-6], k_eris=k_eris)[0]
+                      for k_eris in (True, False)]
+        self.assertAlmostEqual(kmcc.e_corr_pt2, smcc.e_corr_pt2, 9)
+        self.assertAlmostEqual(kmcc.e_corr_ccsd, smcc.e_corr_ccsd, 9)
+
     def test_exxdiv_independent(self):
         ''' The Madelung shift is removed from the k2s Fock iff it is in kmf.mo_energy. '''
         ecc = [self._klno(self._kmf([2,1,1], [0.25,0,0], exxdiv=exxdiv),

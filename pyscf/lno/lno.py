@@ -42,9 +42,8 @@ from pyscf.lib import logger
 from pyscf import lib
 from pyscf import __config__
 
-from pyscf.lno.make_lno_rdm1 import make_lo_rdm1_occ, make_lo_rdm1_vir
+from pyscf.lno.make_lno_rdm1 import make_lo_rdm1
 from pyscf.lno import drpa
-from pyscf.lno import domain
 from pyscf.lno.tools import df_loop
 
 einsum = lib.einsum
@@ -90,7 +89,8 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
         eris (optional):
             Full-system integrals from `mlno.ao2mo`. Built here if not given. Integrals
             passed in are used for every fragment and left intact for the caller
-            (`delete_full_eris` only applies to integrals built here).
+            (`delete_full_eris` only applies to integrals built here). They may be given
+            dressed (`mlno.get_dress_eris`).
     '''
     nfrag = len(frag_lolist)
     if lno_pct_occ is None:
@@ -108,16 +108,18 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
     frag_lno, frag_eners, frag_res = mlno._restart_frags(lo_coeff, frag_lolist)
     nlas = sum(frag_res[i] is None and frag_lno[i] is None for i in range(nfrag))
 
-    # Only integrals built here are torn down: by `delete_full_eris` before each impurity
-    # problem, and at the end otherwise.
-    eris_created_here = eris is None
-    delete_eris = mlno.delete_full_eris and eris_created_here
-    if mlno.delete_full_eris and not eris_created_here:
+    # The integrals passed in (`eris`) are kept for the caller. Those built here (`full_eris`
+    # and `dressed_eris`) are torn down by `delete_full_eris` before each impurity problem,
+    # and at the end otherwise.
+    delete_eris = mlno.delete_full_eris and eris is None
+    if mlno.delete_full_eris and eris is not None:
         log.info('delete_full_eris: the integrals passed to kernel are kept')
     if delete_eris and nlas > 1:
         log.info('delete_full_eris: the full-system integrals%s are rebuilt for each of '
                  'the %d fragments that need LNOs',
                  ' and dRPA amplitudes' if mlno._lno_uses_rpa else '', nlas)
+
+    full_eris = dressed_eris = None
 
     cput2 = cput1 = (logger.process_clock(), logger.perf_counter())
 
@@ -128,11 +130,15 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
 
         # LNO active space: build it or reuse the one given
         if frag_lno[ifrag] is None:
-            if eris is None: eris = mlno.ao2mo()   # released by delete_full_eris
+            if dressed_eris is None:
+                if eris is None:   # built here, and again after delete_full_eris
+                    full_eris, dressed_eris = mlno._build_eris()
+                else:
+                    full_eris, dressed_eris = eris, mlno.get_dress_eris(eris)
             orbloc, lno_param = _frag_orbloc(lo_coeff, loidx, ifrag, lno_thresh,
                                              lno_pct_occ, lno_norb)
-            lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(eris, orbloc, lno_type,
-                                                                lno_param)
+            lnofrag, frozen, uocc_loc, frag_msg = mlno.make_las(dressed_eris, orbloc,
+                                                                lno_type, lno_param)
             if mlno.save_lno:
                 mlno._chk_dump_frag(ifrag, 'las',
                                     dict(orbloc=orbloc, **mlno._pack_las(lnofrag, frozen)))
@@ -144,35 +150,14 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
             frag_lno[ifrag] = None
             log.info('Fragment %d/%d  LAS: restored', ifrag+1, nfrag)
 
-        if delete_eris and eris is not None:
+        if delete_eris and dressed_eris is not None:
             log.info('Releasing the full-system integrals')
-            mlno._release_full_eris(eris)
-            eris = None
-
-        # calculate domains/prune basis
-        if mlno.prune_lno_basis:
-            # compute domain
-            mf_frag, lnofrag, uocc_loc, eris, frozen = \
-                domain.prune_lno_basis(mf, lnofrag, orbloc, uocc_loc, eris,
-                                   frozen, bp_thr=mlno.lno_basis_thresh)
-
-            log.info('Domain: %d/%d basis functions', mf_frag.mol.nao,
-                     mf.mol.nao)
-
-            # set properties
-            mlno._scf = mf_frag
-            mlno._mo_occ = mf_frag.mo_occ
-            mlno._s1e = mlno._scf.get_ovlp()
-            mlno._h1e = None
-            mlno._vhf = None
-            mlno._precompute()
-            mlno.lnofrag=lnofrag.copy()
-
-        else:
-            mf_frag = mf
+            mlno._release_full_eris(full_eris, dressed_eris)
+            full_eris = dressed_eris = None
 
         # solve impurity problem
-        frag_res[ifrag], frag_msg = mlno.impurity_solve(mf_frag, lnofrag, uocc_loc, eris, frozen=frozen)
+        frag_res[ifrag], frag_msg = mlno.impurity_solve(mf, lnofrag, uocc_loc, full_eris,
+                                                        frozen=frozen)
         lnofrag = frozen = uocc_loc = None
         frag_eners[ifrag] = mlno._frag_res_to_dict(frag_res[ifrag])
         mlno._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
@@ -180,19 +165,9 @@ def kernel(mlno, lo_coeff, frag_lolist, lno_type, lno_thresh=None, lno_pct_occ=N
         log.info('Fragment %d/%d  Sol: %s', ifrag+1, nfrag, frag_msg)
         cput1 = log.timer('Fragment %d'%(ifrag+1)+' '*(8-len(str(ifrag+1))), *cput1)
 
-        # reinitialize basis for active-space calc
-        if mlno.prune_lno_basis:
-            # reset properties
-            mlno._scf = mf
-            mlno._mo_occ = None
-            mlno._s1e = None
-            mlno._h1e = None
-            mlno._vhf = None
-            mlno._precompute()
-
-    if eris is not None and eris_created_here:
-        mlno._release_full_eris(eris)
-    eris = None
+    if eris is None and dressed_eris is not None:
+        mlno._release_full_eris(full_eris, dressed_eris)
+    full_eris = dressed_eris = None
 
     classname = mlno.__class__.__name__
     cput0 = log.timer(classname+' '*(17-len(classname)), *cput0)
@@ -328,7 +303,8 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
 
     ''' LNO construction
     '''
-    dmoo = mlno.make_lo_rdm1_occ(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[0])
+    dmoo, dmvv = mlno.make_lo_rdm1(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type)
+    cput1 = log.timer_debug1('make_lo_rdm1', *cput1)
     if mlno._match_oldcode: dmoo *= 0.5 # TO MATCH OLD LNO CODE
     dmoo = reduce(np.dot, (uocc_orth.T.conj(), dmoo, uocc_orth))
     if lno_param[0]['norb'] is not None:
@@ -338,9 +314,7 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
     uoccact = subspace_eigh(np.diag(moeocc), np.hstack((uoccact_orth, uocc_std, uocc_loc)))[1]
     orboccact = np.dot(orbocc, uoccact)
     uoccact_loc = np.linalg.multi_dot((orboccact.T.conj(), s1e, orbloc))
-    cput1 = log.timer_debug1('make_lo_rdm1_occ', *cput1)
 
-    dmvv = mlno.make_lo_rdm1_vir(eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type[1])
     if mlno._match_oldcode: dmvv *= 0.5 # TO MATCH OLD LNO CODE
     if uvir_orth is not None:
         dmvv = reduce(np.dot, (uvir_orth.T.conj(), dmvv, uvir_orth))
@@ -356,7 +330,7 @@ def make_las(mlno, eris, orbloc, lno_type, lno_param):
         uviract = reduce(np.dot, (orbvir.T.conj(), s1e, orbviract))
         uviract = subspace_eigh(np.diag(moevir), uviract)[1]
         orbviract = np.dot(orbvir, uviract)
-    cput1 = log.timer_debug1('make_lo_rdm1_vir', *cput1)
+    cput1 = log.timer_debug1('LNO selection', *cput1)
 
     ''' LAS construction
     '''
@@ -489,10 +463,6 @@ class LNO(lib.StreamObject):
         self.frag_wghtlist = None
         self.verbose_imp = 0 # allow separate verbose level for `impurity_solve`
 
-        # domain parameters
-        self.prune_lno_basis = False  # whether or not to use domains
-        self.lno_basis_thresh = 0.02  # default Boughton-Pulay parameter
-
         # low-level amplitudes
         #   lno_amp : amplitudes for the LNO density matrices
         #             'mp2', 'kappa-mp2', 'rpa' or 'sosex' ('rpa' and 'sosex'
@@ -510,7 +480,6 @@ class LNO(lib.StreamObject):
         # full-system drCCD is solved for the LNOs (lno_amp 'rpa' / 'sosex')
         self.e_corr_rpa_full = None
         self.e_corr_sosex_full = None
-        self._rpa_eris = None
 
         # df eri
         self._ovL = None
@@ -766,43 +735,63 @@ class LNO(lib.StreamObject):
         lno_pct_occ = [None, None] if self.lno_pct_occ is None else self.lno_pct_occ
         lno_norb = [[None, None]] * self.nfrag if self.lno_norb is None else self.lno_norb
 
-        eris_built_here = eris is None
-        if eris_built_here:
-            eris = self.ao2mo()
+        if eris is None:
+            full_eris, dressed_eris = self._build_eris()
+        else:
+            full_eris, dressed_eris = eris, self.get_dress_eris(eris)
 
         frag_lno = []
         for i in ifraglist:
             orbloc, lno_param = _frag_orbloc(self.lo_coeff, self.frag_lolist[i], i,
                                              self.lno_thresh, lno_pct_occ, lno_norb)
-            lnofrag, frozen = self.make_las(eris, orbloc, self.lno_type, lno_param)[:2]
+            lnofrag, frozen = self.make_las(dressed_eris, orbloc, self.lno_type, lno_param)[:2]
             frag_lno.append(self._pack_las(lnofrag, frozen))
 
-        if eris_built_here:
-            self._release_full_eris(eris)
+        if eris is None:   # built here
+            self._release_full_eris(full_eris, dressed_eris)
 
         return frag_lno[0] if single else frag_lno
 
-    def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        return make_lo_rdm1_occ(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
-                                uvir_loc, occ_lno_type)
-
-    def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        return make_lo_rdm1_vir(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
-                                uvir_loc, vir_lno_type)
-
-    def _lno_amp_eris(self, eris):
-        r''' The integrals the LNO density matrices of `lno_amp` are built from: `eris`
-        for MP2, otherwise a `_DressedERIS` damping the amplitudes (kappa-MP2) or holding the
-        dressed integrals of the full-system drCCD (RPA/SOSEX; solved once per `eris`).
+    def get_dress_eris(self, eris):
+        r''' The integrals dressed for `lno_amp`: `eris` itself for MP2, damped for kappa-MP2,
+        or dressed by the full-system drCCD (solved here) for RPA/SOSEX. Integrals that are
+        already dressed for `lno_amp` are returned as they are.
         '''
         amp = self._lno_amp
+        dressed_for = getattr(eris, 'dressed_for', 'mp2')   # plain integrals are MP2 ones
+        if dressed_for == amp:
+            return eris
+        if dressed_for != 'mp2':
+            raise ValueError('eris are dressed for lno_amp = %s, not %s' % (dressed_for, amp))
         if amp == 'kappa-mp2':
-            return _DressedERIS(eris, kappa=self.kappa)
-        if amp in ('rpa', 'sosex'):
-            if self._rpa_eris is None or self._rpa_eris[0] is not eris:
-                self._rpa_eris = (eris, _DressedERIS(eris, ovL=self.solve_rpa(eris)))
-            return self._rpa_eris[1]
-        return eris
+            dressed_eris = _DressedERIS(eris, kappa=self.kappa)
+        elif amp in ('rpa', 'sosex'):
+            dressed_eris = self._dress_rpa(eris)
+        else:
+            raise ValueError('lno_amp = %s has no dressing' % amp)
+        dressed_eris.dressed_for = amp
+        return dressed_eris
+
+    def _dress_rpa(self, eris):
+        r''' `eris` dressed by the full-system drCCD (RPA/SOSEX). '''
+        return _DressedERIS(eris, ovL=self.solve_rpa(eris))
+
+    def make_lo_rdm1(self, eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type):
+        r''' Occupied and virtual LNO density matrices of a fragment for lno_type =
+        [occ_type, vir_type] (a type that is None is not made). Pass `eris` dressed
+        (`get_dress_eris`), as `make_las` does: plain integrals are dressed on every call,
+        which for RPA/SOSEX solves the full-system drCCD again.
+        '''
+        return make_lo_rdm1(self.get_dress_eris(eris), moeocc, moevir, uocc_loc, uvir_loc,
+                            lno_type)
+
+    def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
+        return self.make_lo_rdm1(eris, moeocc, moevir, uocc_loc, uvir_loc,
+                                 [occ_lno_type, None])[0]
+
+    def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
+        return self.make_lo_rdm1(eris, moeocc, moevir, uocc_loc, uvir_loc,
+                                 [None, vir_lno_type])[1]
 
     _AMP_TYPES = tuple(PT2_LABELS)
 
@@ -810,8 +799,6 @@ class LNO(lib.StreamObject):
         amp = str(amp).lower()
         if amp not in self._AMP_TYPES:
             raise ValueError('%s must be one of %s (got %s)' % (name, self._AMP_TYPES, amp))
-        if amp in ('rpa', 'sosex') and self.prune_lno_basis:
-            raise NotImplementedError('RPA/SOSEX amplitudes do not support prune_lno_basis.')
         return amp
 
     @property
@@ -836,28 +823,24 @@ class LNO(lib.StreamObject):
     def _pt2_label(self):
         return PT2_LABELS[self._pt2_amp]
 
-    @property
-    def _e_full_scale(self):
-        r''' Factor converting a full-system energy to the units of the fragment sum. '''
-        return 1.
-
     def DRPA(self):
         r''' The drCCD solver (`rpa_solver`) for the full system and the impurities. '''
         return drpa.DRPA(solver=self.rpa_solver, max_memory=self.max_memory,
                          verbose=self.verbose, stdout=self.stdout)
 
-    def solve_rpa(self, eris):
-        r''' Full-system drCCD from `eris`. Sets `e_corr_rpa_full` and `e_corr_sosex_full`
-        and returns the dressed integrals U[i,a,P] (see `pyscf.regpt2.driccd`).
+    def solve_rpa(self, eris, ncells=1):
+        r''' Full-system drCCD from `eris`. Sets `e_corr_rpa_full` and `e_corr_sosex_full`, per
+        unit cell for the integrals of a supercell of `ncells` cells, and returns the dressed
+        integrals U[i,a,P] (see `pyscf.regpt2.driccd`).
         '''
         log = logger.new_logger(self)
         mrpa = self.DRPA()
         mrpa.kernel(drpa.get_ovJ(eris), *self.split_mo_energy()[1:3])
-        self.e_corr_rpa_full = mrpa.e_corr * self._e_full_scale
+        self.e_corr_rpa_full = mrpa.e_corr / ncells
         log.note('Full-system drCCD (%s):  converged = %s  E_corr(RPA) = %.15g',
                  mrpa.solver, mrpa.converged, self.e_corr_rpa_full)
         if mrpa.e_corr_sosex is not None:
-            self.e_corr_sosex_full = mrpa.e_corr_sosex * self._e_full_scale
+            self.e_corr_sosex_full = mrpa.e_corr_sosex / ncells
             log.note('Full-system drCCD:  E_corr(SOSEX) = %.15g', self.e_corr_sosex_full)
         self._chk_dump_full()
         return mrpa.U
@@ -881,13 +864,24 @@ class LNO(lib.StreamObject):
     def nmo(self):
         return self.get_nmo()
 
-    def _release_full_eris(self, eris):
-        r''' Release full-system integrals built here, with the dressed integrals cached
-        on them.
+    def _build_eris(self):
+        r''' Full-system integrals and their dressed integrals (`get_dress_eris`). With
+        RPA/SOSEX the plain integrals are released at once (nothing else uses them; the
+        impurity problems build their own) and None is returned for them.
         '''
-        if self._rpa_eris is not None and self._rpa_eris[0] is eris:
-            self._rpa_eris = None
-        _release_eris(eris)
+        eris = self.ao2mo()
+        dressed_eris = self.get_dress_eris(eris)
+        if self._lno_uses_rpa:
+            _release_eris(eris)
+            eris = None
+        return eris, dressed_eris
+
+    def _release_full_eris(self, eris, dressed_eris=None):
+        r''' Release full-system integrals built here, and their dressed integrals. '''
+        if dressed_eris is not None and dressed_eris is not eris:
+            _release_eris(dressed_eris)
+        if eris is not None:
+            _release_eris(eris)
 
     def _pack_las(self, lnofrag, frozen):
         r''' Active LNOs {'lno_occ', 'lno_vir'} of an LAS returned by `make_las`. '''

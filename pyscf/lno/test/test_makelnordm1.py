@@ -21,6 +21,7 @@ from functools import reduce
 from pyscf import __config__
 setattr(__config__, 'lnocc_DEBUG_BLKSIZE', True)    # debug outcore mode
 from pyscf import gto, scf, lo, lib
+from pyscf.lno import make_lno_rdm1
 from pyscf.lno.make_lno_rdm1 import *
 from pyscf.lno.lno import _LNODFINCOREERIS
 
@@ -51,10 +52,15 @@ class WaterDimer(unittest.TestCase):
         cls.mf = mf
         cls.frozen = frozen
 
+        # density matrices in several occupied/virtual blocks (debug outcore mode)
+        cls.debug_blksize = make_lno_rdm1.DEBUG_BLKSIZE
+        make_lno_rdm1.DEBUG_BLKSIZE = True
+
     @classmethod
     def tearDownClass(cls):
+        make_lno_rdm1.DEBUG_BLKSIZE = cls.debug_blksize
         cls.mol.stdout.close()
-        del cls.mol, cls.mf, cls.frozen
+        del cls.mol, cls.mf, cls.frozen, cls.debug_blksize
 
     def test_make_rdm1(self):
         mol = self.mol

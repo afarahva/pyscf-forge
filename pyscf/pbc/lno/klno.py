@@ -44,8 +44,7 @@ from pyscf.lno import LNO, drpa
 from pyscf.pbc.regpt2 import kdriccd
 from pyscf.pbc.lib.kpts_helper import get_kconserv
 from pyscf.pbc.lno.tools import K2SDF, k2s_scf, is_trs_kmesh, s2k_mo_coeff
-from pyscf.pbc.lno.make_lno_rdm1 import (make_lo_rdm1_occ, make_lo_rdm1_vir,
-                                         make_lo_rdm1_1h_occ_k, make_lo_rdm1_1h_vir_k)
+from pyscf.pbc.lno.make_lno_rdm1 import make_lo_rdm1, make_lo_rdm1_k
 
 einsum = lib.einsum
 
@@ -78,14 +77,8 @@ class KLNO(LNO):
         frozen (int or list):
             Same as the `frozen` attr in MP2/CCSD etc. modules.
         k_eris (bool):
-            Build the LNO density matrices from the k-point DF integrals of the Bloch
-            orbitals (`make_lno_rdm1.make_lo_rdm1_1h_k`) instead of the supercell-layout
-            integrals: ~Nk/2 times less memory. For RPA/SOSEX LNOs the full-system drCCD
-            is then solved with k-point symmetry (`pyscf.pbc.regpt2.kdriccd`). Used for
-            '1h'/'1h' LNOs with in-core integrals and active orbitals made of whole bands;
-            otherwise a RuntimeError is raised. Set k_eris = False to use the supercell
-            integrals instead.
-            Default is True.
+            Use k-point instead of supercell DF integrals for '1h'/'1p' LNOs (~Nk/2 times
+            less memory); raises if they cannot be used. Default is True.
     '''
 
     def __init__(self, kmf, lo_coeff, frag_lolist, lno_type=None, lno_thresh=None, frozen=None,
@@ -150,7 +143,7 @@ class KLNO(LNO):
         (see `k_eris`). Raises RuntimeError where they do not apply.
         '''
         log = logger.new_logger(self)
-        if list(self.lno_type) != ['1h','1h']:
+        if not set(self.lno_type) <= {'1h','1p'}:
             reason = 'lno_type = %s' % self.lno_type
         elif (self._ovL is not None or self._ovL_to_save is not None or
               self.force_outcore_ao2mo or self.with_df is None):
@@ -184,19 +177,12 @@ class KLNO(LNO):
         log.timer('Integral xform   ', *cput0)
         return eris
 
-    @property
-    def _e_full_scale(self):
-        r''' Full-system (supercell) energies are reported per unit cell, matching the
-        fragment energies of one unit cell's fragments (and KMP2).
-        '''
-        return 1. / len(self.kpts)
-
     def solve_rpa(self, eris):
         r''' Full-system drCCD (see `LNO.solve_rpa`); with k-point symmetry for the k-point
         integrals of `ao2mo_k`, returning the dressed integrals as a `_KLNODFKERIS`.
         '''
-        if not isinstance(eris, _KLNODFKERIS):
-            return LNO.solve_rpa(self, eris)
+        if not isinstance(eris, _KLNODFKERIS):   # supercell: energies per unit cell
+            return LNO.solve_rpa(self, eris, ncells=len(self.kpts))
         log = logger.new_logger(self)
         mrpa = self.DRPA()
         J, D = eris.get_ovJ()
@@ -215,12 +201,19 @@ class KLNO(LNO):
         J = None
         return eris.dress(U)
 
-    def _lno_amp_eris(self, eris):
-        if self._lno_uses_rpa and isinstance(eris, _KLNODFKERIS):
-            if self._rpa_eris is None or self._rpa_eris[0] is not eris:
-                self._rpa_eris = (eris, self.solve_rpa(eris))
-            return self._rpa_eris[1]
-        return LNO._lno_amp_eris(self, eris)
+    def _dress_rpa(self, eris):
+        r''' As `LNO._dress_rpa`, with the dressed integrals in the layout of `eris`, so that
+        the same density matrix code handles them.
+        '''
+        if isinstance(eris, _KLNODFKERIS):
+            return self.solve_rpa(eris)     # the k-point drCCD returns the dressed integrals
+        # supercell: the drCCD is solved from J = [ovLR | ovLI] (see `drpa.get_ovJ`), so the
+        # two halves of the aux index of the dressed U are the dressed ovLR and ovLI
+        U = self.solve_rpa(eris)
+        dressed = copy.copy(eris)
+        dressed.feri = None
+        dressed.ovLR, dressed.ovLI = np.split(U, 2, axis=2)
+        return dressed
 
     def get_ovJ(self, orbocc, orbvir):
         r''' Real DF integrals J[i,a,P] of the real supercell orbitals `orbocc` and
@@ -231,24 +224,12 @@ class KLNO(LNO):
         eris.build()
         return drpa.get_ovJ(eris)
 
-    # The dressed integrals of RPA/SOSEX are real and in core: molecular rdm1 code
-    def make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc, occ_lno_type):
-        if isinstance(eris, _KLNODFKERIS):
-            return make_lo_rdm1_1h_occ_k(self._lno_amp_eris(eris), uocc_loc)
-        if self._lno_uses_rpa:
-            return LNO.make_lo_rdm1_occ(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
-                                        occ_lno_type)
-        return make_lo_rdm1_occ(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
-                                uvir_loc, occ_lno_type)
-
-    def make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc, vir_lno_type):
-        if isinstance(eris, _KLNODFKERIS):
-            return make_lo_rdm1_1h_vir_k(self._lno_amp_eris(eris), uocc_loc)
-        if self._lno_uses_rpa:
-            return LNO.make_lo_rdm1_vir(self, eris, moeocc, moevir, uocc_loc, uvir_loc,
-                                        vir_lno_type)
-        return make_lo_rdm1_vir(self._lno_amp_eris(eris), moeocc, moevir, uocc_loc,
-                                uvir_loc, vir_lno_type)
+    def make_lo_rdm1(self, eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type):
+        r''' As `LNO.make_lo_rdm1`, from the k-point or the supercell integrals. '''
+        dressed_eris = self.get_dress_eris(eris)
+        if getattr(dressed_eris, 'kpoint_integrals', False):
+            return make_lo_rdm1_k(dressed_eris, uocc_loc, uvir_loc, lno_type)
+        return make_lo_rdm1(dressed_eris, moeocc, moevir, uocc_loc, uvir_loc, lno_type)
 
 
 def _bloch_orbitals(kmf, orb, tol=1e-6):
@@ -292,7 +273,7 @@ def _bloch_orbitals(kmf, orb, tol=1e-6):
 
 class _KLNODFKERIS(lib.StreamObject):
     r''' k-point DF integrals of the active Bloch orbitals, for the LNO density matrices
-    (`make_lno_rdm1.make_lo_rdm1_1h_k`)
+    (`make_lno_rdm1.make_lo_rdm1_1h_k` and `make_lo_rdm1_1p_k`)
 
         Lov[ki,ka][L,i,a] = (ki i, ka a|L) / sqrt(Nk),   (ia|jb) = \sum_L Lov[ki,ka] Lov[kj,kb]
 
@@ -300,6 +281,9 @@ class _KLNODFKERIS(lib.StreamObject):
     the overlaps `Wocc`/`Wvir` (W(k p,I) = <k p|I>) of the Bloch and the supercell
     canonical orbitals `orbocc`/`orbvir`.
     '''
+    # tells KLNO.make_lo_rdm1 to use the k-point code (also through the kappa-MP2 wrapper)
+    kpoint_integrals = True
+
     def __init__(self, with_df, orbocc, orbvir, occ, vir, max_memory, verbose=None,
                  stdout=None):
         self.with_df = with_df
@@ -494,8 +478,8 @@ class _KLNODFOUTCOREERIS_REAL(_KLNODFINCOREERIS_REAL):
             else:
                 self.feri = lib.H5TmpFile()
             log.info('ovL is saved to %s', self.feri.filename)
-            # one chunk per occupied orbital, as in lno.py; _init_mp_df_eris_real writes
-            # whole ovL[i0:i1] rows so each chunk is written once and read contiguously
+            # one chunk per occupied orbital, as in lno.py: rows are read contiguously, and
+            # _init_mp_df_eris_real writes whole rows (all q) so each chunk is written once
             chunks = (1,self.nvir,self.Naux_ibz)
             self.ovLR = self.feri.create_dataset('ovLR', ovL_shape, ovL_dtype, chunks=chunks)
             self.ovLI = self.feri.create_dataset('ovLI', ovL_shape, ovL_dtype, chunks=chunks)
@@ -513,150 +497,131 @@ class _KLNODFOUTCOREERIS_REAL(_KLNODFINCOREERIS_REAL):
             raise RuntimeError
 
 def _init_mp_df_eris_real(k2sdf, orbocc, orbvir, max_memory, ovLR=None, ovLI=None, log=None):
-    r''' ovL[q,I,A,L] := (I A | L,q)
-                      = \sum_{k} \sum_{mu,nu} (mu,k nu,k-q | L,q) C(mu,k I).conj() C(nu,k-q A)
-    '''
-    from pyscf.ao2mo import _ao2mo
+    r''' Real and imaginary parts ovLR/ovLI of the supercell DF integrals
 
+        ovL[I,A,(q,L)] = w_q (I A | L,q)
+                       = w_q \sum_{(ki,kj) in q} \sum_{mu,nu} (mu,ki nu,kj | L,q)
+                                                  C(mu,ki I).conj() C(nu,kj A)
+
+    with w_q the IBZ weights of `k2sdf`. ovL is made in blocks of occupied rows I (all rows
+    at once in core), q by q (`_ovL_qblock`). Out of core (ovLR/ovLI are HDF5 datasets with
+    one chunk per row), the rows of a block are kept in memory until all q are done and are
+    then written as whole chunks; the AO integrals are read once per block, i.e. once if
+    the memory holds all rows.
+    '''
     if log is None: log = logger.Logger(sys.stdout, 3)
+    cput1 = (logger.process_clock(), logger.perf_counter())
 
     korbocc = k2sdf.s2k_mo_coeff(orbocc)
     korbvir = k2sdf.s2k_mo_coeff(orbvir)
-    naux_by_q = k2sdf.naux_by_q
+    nao, nocc = korbocc[0].shape
+    nvir = korbvir[0].shape[1]
     naux = k2sdf.naux
     Naux = k2sdf.Naux_ibz
     nqpts = len(k2sdf.qpts_ibz)
-
-    REAL = np.float64
-    COMPLEX = np.complex128
-    dsize = 8
-
-    nao, nocc = korbocc[0].shape
-    nvir = korbvir[0].shape[1]
+    npair = max(len(k2sdf.kikj_by_q[q]) for q in k2sdf.ibz2bz)
 
     if ovLR is None:
-        ovLR = np.empty((nocc,nvir,Naux), dtype=REAL)
-        ovLI = np.empty((nocc,nvir,Naux), dtype=REAL)
-
-    cput1 = (logger.process_clock(), logger.perf_counter())
-
-    mem_avail  = max_memory - lib.current_memory()[0]
-
-    if isinstance(ovLR, np.ndarray):
-        mem_avail -= Naux*nocc*nvir*2 * dsize/1e6   # subtract mem for holding ovLR/I incore
-    else:
-        return _init_mp_df_eris_real_outcore(k2sdf, orbocc, orbvir, mem_avail, ovLR, ovLI, log)
-    mode = 'incore'
-
-    # batching aux (OV*3 + Nao_pair) * [X] = M
-    mem_auxblk = (nao**2+nocc*nvir*3) * dsize/1e6
-    aux_blksize = min(naux, max(1, int(np.floor(mem_avail*0.7 / mem_auxblk))))
-    if DEBUG_BLKSIZE: aux_blksize = max(1,naux//2)
-    log.debug('aux blksize for %s ao2mo: %d/%d', mode, aux_blksize, naux)
-    buf = np.empty(aux_blksize*nocc*nvir, dtype=COMPLEX)
-    bufR = np.empty(aux_blksize*nocc*nvir, dtype=REAL)
-    bufI = np.empty(aux_blksize*nocc*nvir, dtype=REAL)
-
-    for qi,q in enumerate(k2sdf.ibz2bz):
-        nauxq = naux_by_q[q]
-        # loop over the padded range [0,naux) so the zero pad [nauxq,naux) is written
-        # together with the data rather than by a separate strided write
-        for p0,p1 in lib.prange(0, naux, aux_blksize):
-            dp = p1 - p0
-            LovR = np.ndarray((dp,nocc,nvir), dtype=REAL, buffer=bufR)
-            LovI = np.ndarray((dp,nocc,nvir), dtype=REAL, buffer=bufI)
-            LovR.fill(0)
-            LovI.fill(0)
-            dpq = min(p1, nauxq) - p0
-            if dpq > 0:
-                auxslice = (p0,p0+dpq)
-                for (ki,kj),LpqR,LpqI in k2sdf.loop_ao2mo(q, orbocc, orbvir, buf=buf,
-                                                          real_and_imag=True, auxslice=auxslice):
-                    LovR[:dpq] += LpqR.reshape(dpq,nocc,nvir)
-                    LovI[:dpq] += LpqI.reshape(dpq,nocc,nvir)
-                    LpqR = LpqI = None
-            w = k2sdf.qpts_ibz_weights[qi]
-            LovR *= w
-            LovI *= w
-            b0 = naux*qi + p0
-            b1 = b0 + dp
-            ovLR[:,:,b0:b1] = LovR.transpose(1,2,0)
-            ovLI[:,:,b0:b1] = LovI.transpose(1,2,0)
-            LovR = LovI = None
-        cput1 = log.timer('ao2mo for qidx %d/%d'%(qi+1,nqpts), *cput1)
-
-    buf = bufR = bufI = None
-
-    return ovLR, ovLI
-
-def _init_mp_df_eris_real_outcore(k2sdf, orbocc, orbvir, mem_avail, ovLR, ovLI, log):
-    r''' Outcore _init_mp_df_eris_real, organized as lno._init_mp_df_eris: for each block of
-    occupied orbitals, all q are transformed into whole ovL[i0:i1] rows in memory, which are
-    then written once. The AO DF integrals are re-read once per occupied block.
-    '''
-    nao = k2sdf.cell.nao_nr()
-    naux_by_q = k2sdf.naux_by_q
-    naux = k2sdf.naux
-    Naux = k2sdf.Naux_ibz
-    nocc = orbocc.shape[1]
-    nvir = orbvir.shape[1]
-
-    REAL = np.float64
-    COMPLEX = np.complex128
-    dsize = 8
-
-    cput1 = (logger.process_clock(), logger.perf_counter())
-
-    # batching occ [O]VX*2 and aux ([O]V*3 + Nao_pair) * [X]
-    mem_occblk = nvir*Naux*2 * dsize/1e6
-    occ_blksize = min(nocc, max(1, int(np.floor(mem_avail*0.6 / mem_occblk))))
-    if DEBUG_BLKSIZE: occ_blksize = max(1,nocc//2)
-    mem_auxblk = (nao**2+occ_blksize*nvir*3) * dsize/1e6
-    aux_blksize = min(naux, max(1, int(np.floor(mem_avail*0.3 / mem_auxblk))))
-    if DEBUG_BLKSIZE: aux_blksize = max(1,naux//2)
-    log.debug('occ blksize for outcore ao2mo: %d/%d', occ_blksize, nocc)
-    log.debug('aux blksize for outcore ao2mo: %d/%d', aux_blksize, naux)
-    bufOR = np.empty(occ_blksize*nvir*Naux, dtype=REAL)
-    bufOI = np.empty(occ_blksize*nvir*Naux, dtype=REAL)
-    buf = np.empty(aux_blksize*occ_blksize*nvir, dtype=COMPLEX)
-    bufR = np.empty(aux_blksize*occ_blksize*nvir, dtype=REAL)
-    bufI = np.empty(aux_blksize*occ_blksize*nvir, dtype=REAL)
+        ovLR = np.empty((nocc,nvir,Naux))
+        ovLI = np.empty((nocc,nvir,Naux))
+    incore = isinstance(ovLR, np.ndarray)
+    mem_avail = max_memory - lib.current_memory()[0]
+    if incore:
+        mem_avail -= nocc*nvir*Naux*2 * 8/1e6
+    occ_blksize, aux_blksize = _ao2mo_blksizes(nocc, nvir, nao, npair, naux, Naux, mem_avail,
+                                               incore, log)
 
     for i0,i1 in lib.prange(0,nocc,occ_blksize):
-        nocci = i1 - i0
-        orbocci = np.asarray(orbocc[:,i0:i1], order='C')
-        OvLR = np.ndarray((nocci,nvir,Naux), dtype=REAL, buffer=bufOR)
-        OvLI = np.ndarray((nocci,nvir,Naux), dtype=REAL, buffer=bufOI)
-        OvLR.fill(0)    # also the zero pad [nauxq,naux) of each q block
-        OvLI.fill(0)
+        if incore:
+            rowsR, rowsI = ovLR, ovLI
+        else:
+            rowsR = np.empty((i1-i0,nvir,Naux))
+            rowsI = np.empty((i1-i0,nvir,Naux))
         for qi,q in enumerate(k2sdf.ibz2bz):
-            nauxq = naux_by_q[q]
-            w = k2sdf.qpts_ibz_weights[qi]
-            for p0,p1 in lib.prange(0, nauxq, aux_blksize):
-                dp = p1 - p0
-                LovR = np.ndarray((dp,nocci,nvir), dtype=REAL, buffer=bufR)
-                LovI = np.ndarray((dp,nocci,nvir), dtype=REAL, buffer=bufI)
-                LovR.fill(0)
-                LovI.fill(0)
-                for (ki,kj),LpqR,LpqI in k2sdf.loop_ao2mo(q, orbocci, orbvir, buf=buf,
-                                                          real_and_imag=True, auxslice=(p0,p1)):
-                    LovR += LpqR.reshape(dp,nocci,nvir)
-                    LovI += LpqI.reshape(dp,nocci,nvir)
-                    LpqR = LpqI = None
-                LovR *= w
-                LovI *= w
-                b0 = naux*qi + p0
-                OvLR[:,:,b0:b0+dp] = LovR.transpose(1,2,0)
-                OvLI[:,:,b0:b0+dp] = LovI.transpose(1,2,0)
-                LovR = LovI = None
-        ovLR[i0:i1] = OvLR
-        ovLI[i0:i1] = OvLI
-        OvLR = OvLI = None
-        cput1 = log.timer('ao2mo for occ %d:%d/%d'%(i0,i1,nocc), *cput1)
-
-    bufOR = bufOI = buf = bufR = bufI = None
+            pairs = k2sdf.kikj_by_q[q]
+            Co = [korbocc[ki][:,i0:i1] for ki,kj in pairs]
+            Cv = np.vstack([korbvir[kj] for ki,kj in pairs])
+            # the padded range [0,naux) of q: the zero pad [naux_q,naux) is written together
+            # with the data rather than by a separate strided write
+            for p0,p1 in lib.prange(0, naux, aux_blksize):
+                b0 = naux*qi
+                _ovL_qblock(k2sdf, q, p0, p1, Co, Cv, k2sdf.qpts_ibz_weights[qi],
+                            rowsR[:,:,b0+p0:b0+p1], rowsI[:,:,b0+p0:b0+p1])
+            if incore:
+                cput1 = log.timer('ao2mo for qidx %d/%d'%(qi+1,nqpts), *cput1)
+        if not incore:
+            ovLR[i0:i1] = rowsR
+            ovLI[i0:i1] = rowsI
+            rowsR = rowsI = None
+            cput1 = log.timer('ao2mo for occ %d:%d/%d'%(i0,i1,nocc), *cput1)
 
     return ovLR, ovLI
+
+def _ovL_qblock(k2sdf, q, p0, p1, Co, Cv, w, outR, outI):
+    r''' outR + 1j*outI = w (I A | L,q) for the aux functions L in [p0,p1) (zero beyond
+    naux_q), with Co[p] = C(mu,ki_p I) and Cv = C(nu,kj_p A) stacked over the (ki,kj) pairs
+    p of q: (\sum_p Nk nao, nvir).
+
+    The occupied index is transformed pair by pair,
+        H(I, (p,nu), L) = \sum_mu C(mu,ki_p I).conj() (mu,ki_p nu,kj_p | L),
+    and the virtual one for all pairs at once, by GEMMs over the stacked index (p,nu),
+        (I A | L) = \sum_{(p,nu)} H(I, (p,nu), L) C(nu,kj_p A),
+    so the sum over the pairs is done inside the GEMMs and the (nocc, nvir) integrals of a
+    single pair, Nk times more numbers than H, are never formed.
+    '''
+    nao, ni = Co[0].shape
+    nvir = Cv.shape[1]
+    dp = p1 - p0
+    dpq = min(p1, k2sdf.naux_by_q[q]) - p0
+    if dpq <= 0:
+        outR[:] = 0
+        outI[:] = 0
+        return outR, outI
+
+    H = np.zeros((ni,len(Co)*nao,dp), dtype=np.complex128)
+    for ip,(_,Lpq) in enumerate(k2sdf.loop(q, auxslice=(p0,p0+dpq))):
+        if Lpq.shape[1] != nao**2:    # aosym = 's2'
+            Lpq = lib.unpack_tril(Lpq)
+        Lpq = Lpq.reshape(dpq,nao,nao).transpose(1,2,0).reshape(nao,nao*dpq)  # (mu,(nu,L))
+        H[:,ip*nao:(ip+1)*nao,:dpq] = lib.dot(Co[ip].conj().T, Lpq).reshape(ni,nao,dpq)
+    HR = np.asarray(H.real, order='C')
+    HI = np.asarray(H.imag, order='C')
+    H = None
+    CvR = np.asarray(Cv.real.T, order='C')
+    CvI = np.asarray(Cv.imag.T, order='C')
+    tmpR = np.empty((nvir,dp))
+    tmpI = np.empty((nvir,dp))
+    for i in range(ni):
+        # (CvR + 1j CvI) (HR + 1j HI), real and imaginary parts
+        lib.ddot(CvR, HR[i], w, tmpR, 0)
+        lib.ddot(CvI, HI[i], -w, tmpR, 1)
+        lib.ddot(CvR, HI[i], w, tmpI, 0)
+        lib.ddot(CvI, HR[i], w, tmpI, 1)
+        outR[i] = tmpR
+        outI[i] = tmpI
+    return outR, outI
+
+def _ao2mo_blksizes(nocc, nvir, nao, npair, naux, Naux, mem_avail, incore, log):
+    r''' Row and aux block sizes of `_init_mp_df_eris_real` (memory in MB). '''
+    K = npair*nao
+    mem_fix = 4*K*nvir * 8/1e6                       # Cv of one q (complex + real/imag)
+    mem_IL = (4*K + 2*nvir) * 8/1e6                  # per row and aux function: H, HR/HI
+    mem_L = (4*nao**2 + 2*nocc*nao + 2*nvir) * 8/1e6  # per aux function: AO integrals, tmp
+    if incore:
+        occ_blksize = nocc
+    else:
+        mem_I = 2*nvir*Naux * 8/1e6                  # whole rows (all q), kept until written
+        occ_blksize = int(np.floor((mem_avail*0.6 - mem_fix) / (mem_I + naux*mem_IL)))
+        occ_blksize = min(nocc, max(1, occ_blksize))
+        mem_avail -= occ_blksize*mem_I
+    aux_blksize = int(np.floor((mem_avail*0.7 - mem_fix) / (occ_blksize*mem_IL + mem_L)))
+    aux_blksize = min(naux, max(1, aux_blksize))
+    if DEBUG_BLKSIZE:
+        aux_blksize = max(1,naux//2)
+        if not incore: occ_blksize = max(1,nocc//2)
+    log.debug('ao2mo (%s): occ blksize %d/%d  aux blksize %d/%d',
+              'incore' if incore else 'outcore', occ_blksize, nocc, aux_blksize, naux)
+    return occ_blksize, aux_blksize
 
 
 ''' DF ERI for complex orbitals
