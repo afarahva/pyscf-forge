@@ -33,6 +33,7 @@ from pyscf import __config__
 from pyscf.lno.make_lno_rdm1 import (subspace_eigh, _mp2_rdm1_occblksize, _mp2_rdm1_virblksize,
                                      _make_t2)
 from pyscf.pbc.lno.tools import zdotCNtoR
+from pyscf.lib.numpy_helper import _dgemm, _zgemm
 
 DEBUG_BLKSIZE = getattr(__config__, 'lno_base_make_rdm1_k2s_DEBUG_BLKSIZE', False)
 # upper bound (MB) on the blocks of ovL rows read at once when streaming ovL
@@ -111,18 +112,22 @@ def make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
     r''' Occupied and virtual MP2 density matrices with one localized hole
 
         Math:
-            T(jcKa) = t2(Kjac),  K the semicanonical localized occupied orbitals
-            dm(i,j) = \sum_{aKb} -4 T(iaKb) T(jaKb) + 2 T(iaKb) T(jbKa)
-            dm(a,b) = \sum_{jcK} 2 T(jcKa) T(jcKb) - T(jcKa) T(jbKc) - T(jaKc) T(jcKb)
-                                 + 2 T(jaKc) T(jbKc)
+            T(Kjca) = t2(Kjac),  K the semicanonical localized occupied orbitals
+            dm(i,j) = \sum_{Kca} -4 T(Kica) T(Kjca) + 2 T(Kica) T(Kjac)
+            dm(a,b) = \sum_{Kjc} 2 T(Kjca) T(Kjcb) - T(Kjca) T(Kjbc) - T(Kjac) T(Kjcb)
+                                 + 2 T(Kjac) T(Kjbc)
 
-        For a block of K, all amplitudes T(j c K a) (nocc nvir^2 per K) are kept in memory.
+        For a block of K, all amplitudes T(K j c a) (nocc nvir^2 per K) are kept in memory.
         They are made in one pass over `ovL` in blocks of occupied rows j (`get_occ_blk`),
         after the pass of `xform_occ`, so each amplitude is made once and each K block reads
-        `ovL` twice, contiguously, for both density matrices. (The blocked algorithm
-        `_make_lo_rdm1_occ_1h_real_blocked`/`_make_lo_rdm1_vir_1h_real_blocked`, which needs
-        less memory but rebuilds the amplitudes of the occupied DM for every occupied block,
-        is used if one K of amplitudes does not fit.)
+        `ovL` twice, contiguously, for both density matrices. Each term is a matrix product
+        of T_K = T(K) and of its transpose W_K(j a c) = T(K j c a), made in blocks of rows j:
+            dm(i,j) += -4 T_K T_K^T + 2 W_K T_K^T                       (rows j, columns ca)
+            dm(a,b) += 2 T_K^T T_K + 2 W_K^T W_K - T_K^T W_K - W_K^T T_K   (rows jc, columns a)
+        (The blocked algorithm `_make_lo_rdm1_occ_1h_real_blocked`/
+        `_make_lo_rdm1_vir_1h_real_blocked`, which needs less memory but rebuilds the
+        amplitudes of the occupied DM for every occupied block, is used if one K of amplitudes
+        does not fit.)
 
         Args:
             eris : ERI object
@@ -142,7 +147,8 @@ def make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
     nOcc = u.shape[1]
 
     # Memory (in numbers): per K the amplitudes T (nocc nvir^2) and KvL (2 nvir naux); per
-    # occupied row of a block the integrals (2 nvir naux) and ~4 amplitude-sized temporaries.
+    # occupied row of a block the integrals (2 nvir naux), the denominators (and kappa factors)
+    # of one K and the rows of W (3 nvir^2).
     mem_avail = eris.max_memory - lib.current_memory()[0]
     M = mem_avail * 0.7 * 1e6/dsize
     mem_K = nocc*nvir**2 + 2*nvir*naux
@@ -158,7 +164,7 @@ def make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
         if with_vir:
             dmvv = _make_lo_rdm1_vir_1h_real_blocked(eris, moeocc, moevir, u)
         return dmoo, dmvv
-    mem_row = 2*nvir*naux + 4*nvir*Occblksize*nvir
+    mem_row = 2*nvir*naux + 3*nvir**2
     occblksize = int(np.floor((M - Occblksize*mem_K) / mem_row))
     occblksize = max(1, min(nocc, occblksize, int(MAX_ROWBLK_MB*1e6/dsize / mem_row)))
     if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
@@ -173,42 +179,47 @@ def make_lo_rdm1_1h_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
 
     dmoo = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None
     dmvv = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None
+    dmvvx = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None   # \sum_K T_K^T W_K
+    buf = np.empty(occblksize*nvir**2, dtype=REAL)
     for K0,K1 in lib.prange(0,nOcc,Occblksize):
         nK = K1 - K0
         KvLR, KvLI = eris.xform_occ(u[:,K0:K1])
-        KvLR = KvLR.reshape(nK*nvir,naux)
-        KvLI = KvLI.reshape(nK*nvir,naux)
-        eKv = eOv[K0:K1]
-        # T(j c K a) for all j, c, a: one pass over the rows j of ovL
-        T = np.empty((nocc,nvir,nK,nvir), dtype=REAL)
+        KvLR = KvLR.reshape(nK,nvir,naux)
+        KvLI = KvLI.reshape(nK,nvir,naux)
+        # T(K j c a) for all j, c, a: one pass over the rows j of ovL
+        T = np.empty((nK,nocc,nvir,nvir), dtype=REAL)
         for j0,j1 in lib.prange(0,nocc,occblksize):
             jcLR, jcLI = eris.get_occ_blk(j0,j1)
-            t2 = zdotCNtoR(jcLR.reshape(-1,naux), jcLI.reshape(-1,naux), KvLR.T, KvLI.T)
-            jcLR = jcLI = None
-            ejcKa = lib.direct_sum('jc+Ka->jcKa', eov[j0:j1], eKv)
-            T[j0:j1] = _make_t2(eris, t2.reshape(ejcKa.shape), ejcKa)
-            t2 = ejcKa = None
+            jcLR = jcLR.reshape(-1,naux)
+            jcLI = jcLI.reshape(-1,naux)
+            for K in range(nK):
+                TK = T[K,j0:j1].reshape(-1,nvir)
+                zdotCNtoR(jcLR, jcLI, KvLR[K].T, KvLI[K].T, cR=TK)
+                ejca = lib.direct_sum('jc+a->jca', eov[j0:j1], eOv[K0+K]).reshape(-1,nvir)
+                _make_t2(eris, TK, ejca)
+            jcLR = jcLI = ejca = None
         KvLR = KvLI = None
-        T2 = T.reshape(nocc,-1)
-        if with_occ:
-            dmoo -= 4 * lib.dot(T2, T2.T)
-        # the remaining contractions in blocks of rows j
-        for j0,j1 in lib.prange(0,nocc,occblksize):
-            Tj = T[j0:j1]
+        for K in range(nK):
+            TK = T[K]
+            T2 = TK.reshape(nocc,-1)
             if with_occ:
-                Tjx = np.ascontiguousarray(Tj.transpose(0,3,2,1)).reshape(j1-j0,-1)
-                dmoo[:,j0:j1] += 2 * lib.dot(T2, Tjx.T)
-                Tjx = None
-            if with_vir:
-                dmvv += 2 * lib.einsum('jcKa,jcKb->ab', Tj, Tj)
-                tmp = lib.einsum('jcKa,jbKc->ab', Tj, Tj)
-                dmvv -= tmp
-                dmvv -= tmp.T
-                dmvv += 2 * lib.einsum('jaKc,jbKc->ab', Tj, Tj)
-                tmp = None
-            Tj = None
-        T = T2 = None
+                lib.dot(T2, T2.T, -4, dmoo, 1)
+            for j0,j1 in lib.prange(0,nocc,occblksize):
+                W = lib.transpose(TK[j0:j1], axes=(0,2,1), out=buf)
+                if with_occ:
+                    lib.dot(W.reshape(j1-j0,-1), T2.T, 2, dmoo[j0:j1], 1)
+                if with_vir:
+                    Tv = TK[j0:j1].reshape(-1,nvir)
+                    Wv = W.reshape(-1,nvir)
+                    lib.dot(Tv.T, Tv, 2, dmvv, 1)
+                    lib.dot(Wv.T, Wv, 2, dmvv, 1)
+                    lib.dot(Tv.T, Wv, 1, dmvvx, 1)
+                W = None
+        T = TK = T2 = None
 
+    if with_vir:
+        dmvv -= dmvvx
+        dmvv -= dmvvx.T
     return dmoo, dmvv
 
 def _make_lo_rdm1_occ_1h_real_blocked(eris, moeocc, moevir, u):
@@ -303,18 +314,24 @@ def make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
     r''' Occupied and virtual MP2 density matrices with one localized particle
 
         Math:
-            X(iAkb) = t2(ikAb),  A the semicanonical localized virtuals
-            dm(i,j) = \sum_{Akb} -2 X(iAkb) X(jAkb) + X(iAkb) X(kAjb) + X(kAib) X(jAkb)
-                                 - 2 X(kAib) X(kAjb)
-            dm(a,b) = \sum_{iAk} 4 X(iAka) X(iAkb) - 2 X(iAka) X(kAib)
+            X(Aikb) = t2(ikAb),  A the semicanonical localized virtuals
+            dm(i,j) = \sum_{Akb} -2 X(Aikb) X(Ajkb) + X(Aikb) X(Akjb) + X(Akib) X(Ajkb)
+                                 - 2 X(Akib) X(Akjb)
+            dm(a,b) = \sum_{Aik} 4 X(Aika) X(Aikb) - 2 X(Aika) X(Akib)
 
-        For a block of A, all amplitudes X(i A k b) (nocc^2 nvir per A) are kept in memory.
-        They are made in one pass over `ovL` in blocks of occupied rows (`get_occ_blk`),
-        after the pass of `xform_vir`, so each amplitude is made once and each A block
-        reads `ovL` twice, contiguously, for both density matrices. (The blocked algorithm
-        `_make_lo_rdm1_occ_1p_real_blocked`/`_make_lo_rdm1_vir_1p_real_blocked`, which needs
-        less memory, rebuilds the amplitudes for every virtual block and reads `ovL` by
-        virtual columns; it is used only if one A of amplitudes does not fit.)
+        For a block of A, all amplitudes X(A i k b) (nocc^2 nvir per A) are kept in memory.
+        They are made in one pass over `ovL` in blocks of occupied rows k (`get_occ_blk`),
+        after the pass of `xform_vir`, so each amplitude is made once and each A block reads
+        `ovL` twice, contiguously, for both density matrices. Each term is a matrix product of
+        X_A = X(A); the terms that exchange i and k are sums of products of its slices
+        X_A(:,k,:) and X_A(k):
+            dm(i,j) += -2 X_A X_A^T + \sum_k [S_k + S_k^T - 2 X_A(k) X_A(k)^T],
+                       S_k = X_A(:,k,:) X_A(k)^T                    (rows i, columns kb)
+            dm(a,b) += 4 X_A^T X_A - 2 \sum_i X_A(i)^T X_A(:,i,:)     (rows ik, columns b)
+        (The blocked algorithm `_make_lo_rdm1_occ_1p_real_blocked`/
+        `_make_lo_rdm1_vir_1p_real_blocked`, which needs less memory, rebuilds the amplitudes
+        for every virtual block and reads `ovL` by virtual columns; it is used only if one A of
+        amplitudes does not fit.)
 
         Args:
             eris : ERI object
@@ -333,13 +350,14 @@ def make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
     assert(u.dtype == REAL)
     nVir = u.shape[1]
 
-    # Memory (in numbers): per A the amplitudes X (nocc^2 nvir) and oAL (2 nocc naux); per
-    # occupied row of a block the integrals (2 nvir naux) and ~4 amplitude-sized temporaries.
+    # Memory (in numbers): per A the amplitudes X (nocc^2 nvir) and oAL (4 nocc naux); per
+    # occupied row of a block the integrals (2 nvir naux) and the denominators (and kappa
+    # factors) of the block of A (2 nocc Virblksize nvir).
     # The row blocks are also bounded so that streaming `ovL` does not take the memory the OS
     # page cache could use to hold it.
     mem_avail = eris.max_memory - lib.current_memory()[0]
     M = mem_avail * 0.7 * 1e6/dsize
-    mem_A = nocc**2*nvir + 2*nocc*naux
+    mem_A = nocc**2*nvir + 4*nocc*naux
     Virblksize = min(nVir, int(np.floor(0.6*M / mem_A)))
     if DEBUG_BLKSIZE: Virblksize = min(Virblksize, max(1,nVir//2))
     if Virblksize < 1:
@@ -352,7 +370,7 @@ def make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
         if with_vir:
             dmvv = _make_lo_rdm1_vir_1p_real_blocked(eris, moeocc, moevir, u)
         return dmoo, dmvv
-    mem_row = 2*nvir*naux + 4*nocc*Virblksize*nvir
+    mem_row = 2*nvir*naux + 2*nocc*Virblksize*nvir
     occblksize = int(np.floor((M - Virblksize*mem_A) / mem_row))
     occblksize = max(1, min(nocc, occblksize, int(MAX_ROWBLK_MB*1e6/dsize / mem_row)))
     if DEBUG_BLKSIZE: occblksize = max(1,nocc//2)
@@ -363,43 +381,58 @@ def make_lo_rdm1_1p_real(eris, moeocc, moevir, u, with_occ=True, with_vir=True):
 
     moeVir, u = subspace_eigh(np.diag(moevir), u)
     eov = moeocc[:,None] - moevir
-    eoV = moeocc[:,None] - moeVir
+    eVo = moeocc - moeVir[:,None]
 
     dmoo = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None
     dmvv = np.zeros((nvir,nvir), dtype=REAL) if with_vir else None
+    dmoox = np.zeros((nocc,nocc), dtype=REAL) if with_occ else None   # \sum_{Ak} S_k
     for A0,A1 in lib.prange(0,nVir,Virblksize):
         nA = A1 - A0
         oALR, oALI = eris.xform_vir(u[:,A0:A1])
-        oALR = oALR.reshape(nocc*nA,naux)
-        oALI = oALI.reshape(nocc*nA,naux)
-        eoA = eoV[:,A0:A1]
-        # X(i A k b) for all k, b: one pass over the rows k of ovL
-        X = np.empty((nocc,nA,nocc,nvir), dtype=REAL)
+        AiLR = np.ascontiguousarray(oALR.reshape(nocc,nA,naux).transpose(1,0,2))
+        AiLI = np.ascontiguousarray(oALI.reshape(nocc,nA,naux).transpose(1,0,2))
+        AiLR = AiLR.reshape(nA*nocc,naux)
+        AiLI = AiLI.reshape(nA*nocc,naux)
+        oALR = oALI = None
+        # X(A i k b) for all i, k, b: one pass over the rows k of ovL, each block of rows
+        # making the columns (k b) of X as a matrix of rows (A i)
+        X = np.empty((nA,nocc,nocc,nvir), dtype=REAL)
+        X2 = X.reshape(nA*nocc,nocc*nvir)
         for k0,k1 in lib.prange(0,nocc,occblksize):
             kbLR, kbLI = eris.get_occ_blk(k0,k1)
-            t2 = zdotCNtoR(oALR, oALI, kbLR.reshape(-1,naux).T, kbLI.reshape(-1,naux).T)
+            ncol = (k1-k0) * nvir
+            # Re[conj(AiL) kbL^T], as zdotCNtoR
+            _dgemm('N', 'T', nA*nocc, ncol, naux, AiLR, kbLR.reshape(ncol,naux), X2,
+                   1, 0, offsetc=k0*nvir)
+            _dgemm('N', 'T', nA*nocc, ncol, naux, AiLI, kbLI.reshape(ncol,naux), X2,
+                   1, 1, offsetc=k0*nvir)
             kbLR = kbLI = None
-            eoAkb = lib.direct_sum('iA+kb->iAkb', eoA, eov[k0:k1])
-            X[:,:,k0:k1] = _make_t2(eris, t2.reshape(eoAkb.shape), eoAkb)
-            t2 = eoAkb = None
-        oALR = oALI = None
-        # contractions, in blocks of the third index k: Xs = X(i A k b) and Xr = X(k A i b)
-        for k0,k1 in lib.prange(0,nocc,occblksize):
-            Xs = np.ascontiguousarray(X[:,:,k0:k1])
-            Xr = X[k0:k1]
+            eAikb = lib.direct_sum('Ai+kb->Aikb', eVo[A0:A1], eov[k0:k1])
+            _make_t2(eris, X2[:,k0*nvir:k1*nvir], eAikb.reshape(nA*nocc,ncol))
+            eAikb = None
+        AiLR = AiLI = None
+        for A in range(nA):
+            XA = X[A]
+            X2A = XA.reshape(nocc,-1)
             if with_occ:
-                dmoo -= 2 * lib.einsum('iAkb,jAkb->ij', Xs, Xs)
-                tmp = lib.einsum('iAkb,kAjb->ij', Xs, Xr)
-                dmoo += tmp
-                dmoo += tmp.T
-                dmoo -= 2 * lib.einsum('kAib,kAjb->ij', Xr, Xr)
-                tmp = None
+                lib.dot(X2A, X2A.T, -2, dmoo, 1)
+                for k in range(nocc):
+                    # S_k(i,j) = \sum_b X(A i k b) X(A k j b);  X(A k i b) X(A k j b)
+                    _dgemm('N', 'T', nocc, nocc, nvir, X2A, XA[k], dmoox, 1, 1,
+                           offseta=k*nvir)
+                    lib.dot(XA[k], XA[k].T, -2, dmoo, 1)
             if with_vir:
-                dmvv += 4 * lib.einsum('iAka,iAkb->ab', Xs, Xs)
-                dmvv -= 2 * lib.einsum('iAka,kAib->ab', Xs, Xr)
-            Xs = Xr = None
-        X = None
+                Xv = XA.reshape(-1,nvir)
+                lib.dot(Xv.T, Xv, 4, dmvv, 1)
+                for i in range(nocc):
+                    # \sum_k X(A i k a) X(A k i b)
+                    _dgemm('T', 'N', nvir, nvir, nocc, XA[i], X2A, dmvv, -2, 1,
+                           offsetb=i*nvir)
+        X = X2 = XA = X2A = None
 
+    if with_occ:
+        dmoo += dmoox
+        dmoo += dmoox.T
     return dmoo, dmvv
 
 def _make_lo_rdm1_occ_1p_real_blocked(eris, moeocc, moevir, u):
@@ -1153,11 +1186,17 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
         the integrals of one momentum transfer q = k_a - k_I = k_j - k_c only.
 
         Both density matrices are sums over c, so the amplitudes are made for a block of I
-        and one k_c at a time, as the slabs
-            t_ac = t2(I j a c),  t_ca = t2(I j c a)     (c in k_c; j, a in all k)
-        which hold every amplitude the density matrices need for those c. Each amplitude is
-        thus made twice (in t_ac of k_c and in t_ca of k_a), but no amplitude array is
-        larger than (nI, Nk*nocc, Nk*nvir, nvir).
+        and one k_c at a time, as the slabs of conjugated amplitudes
+            U_ac(j c I a) = t2(I j a c).conj(),  U_ca(j c I a) = t2(I j c a).conj()
+            (c in k_c; j, a in all k)
+        which hold every amplitude the density matrices need for those c. Each term is a
+        matrix product of the slabs, as matrices of rows (j c I) and columns a, or of rows j
+        and columns (c I a):
+            dm(a,b) += 2 U_ac^H U_ac + 2 U_ca^H U_ca - U_ac^H U_ca - U_ca^H U_ac
+            dm(i,j) += 2 U_ac U_ca^H - 4 U_ac U_ac^H
+        U_ac is made by one matrix product per k_j; U_ca by one per q, in rows (I c), copied
+        into place. Each amplitude is thus made twice (in U_ac of k_c and in U_ca of k_a), but
+        no amplitude array is larger than (Nk*nocc, nvir, nI, Nk*nvir).
 
         Args:
             eris : _KLNODFKERIS
@@ -1185,62 +1224,78 @@ def make_lo_rdm1_1h_k(eris, u, with_occ=True, with_vir=True):
     cI = cI.reshape(nkpts,nocc,-1)
     nOcc = eI.size
 
-    # determine Occblksize: per I, the (I a|L) of all q and ~6 slabs (t_ac, t_ca,
-    # temporaries); fixed, the density matrices and jaL
+    # determine Occblksize: per I, the (I a|L) of all q and ~3 slabs (U_ac, U_ca, the
+    # products of one q and the denominators); fixed, the density matrices and jaL
     mem_avail = eris.max_memory - lib.current_memory()[0]
-    mem_fix = (nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
-    mem_I = (nkpts*naux*nkv + 6*nko*nkv*nvir) * dsize/1e6
+    mem_fix = (nko**2*with_occ + 2*nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
+    mem_I = (nkpts*naux*nkv + 3*nko*nkv*nvir) * dsize/1e6
     Occblksize = max(1, min(nOcc, int(np.floor((mem_avail*0.7 - mem_fix) / mem_I))))
     if DEBUG_BLKSIZE: Occblksize = max(1,nOcc//2)
     logger.debug1(eris, 'make_lo_rdm1_1h_k :  nkpts = %d  nocc = %d  nvir = %d  nOcc = %d  '
                   'naux = %d  Occblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nOcc,
                   naux, Occblksize, mem_fix + Occblksize*mem_I)
 
-    # jaL[q] = (j a|L) of all k_j, with k_a = k_j - q: (naux_q, Nk, nocc, nvir)
+    # jaL[q] = (j a|L) of all k_j, with k_a = k_j - q: (naux_q, Nk*nocc*nvir)
     kjs = np.arange(nkpts)
-    jaL = [np.stack([Lov[kj,kconserv[kj,q,0]] for kj in kjs], axis=1) for q in range(nkpts)]
+    jaL = [np.stack([Lov[kj,kconserv[kj,q,0]] for kj in kjs], axis=1).reshape(-1,nko*nvir)
+           for q in range(nkpts)]
 
     dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
     dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
-    eov, evv = eo.ravel(), ev.ravel()
+    dmvvx = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None   # \sum U_ac^H U_ca
+    evv = ev.ravel()
     for I0,I1 in lib.prange(0,nOcc,Occblksize):
         nI = I1 - I0
         eIv = eI[I0:I1]
-        # IaL[q] = (I a|L) of all k_a, with k_I = k_a - q: (naux_q, Nk, nI, nvir)
+        # IaL[q] = (I a|L) of all k_a, with k_I = k_a - q: (naux_q, nI*Nk*nvir)
         IaL = [np.stack([lib.einsum('Lia,iI->LIa', Lov[kconserv[ka,q,0],ka],
                                     cI[kconserv[ka,q,0],:,I0:I1].conj())
-                         for ka in range(nkpts)], axis=1) for q in range(nkpts)]
-        t_ac = np.empty((nI,nkpts,nocc,nkpts,nvir,nvir), dtype=COMPLEX)
-        t_ca = np.empty((nI,nkpts,nocc,nvir,nkpts,nvir), dtype=COMPLEX)
+                         for ka in range(nkpts)], axis=2).reshape(-1,nI*nkv)
+               for q in range(nkpts)]
+        U_ac = np.empty((nkpts,nocc,nvir,nI,nkv), dtype=COMPLEX)
+        U_ca = np.empty((nkpts,nocc,nvir,nI,nkv), dtype=COMPLEX)
+        U_ca6 = U_ca.reshape(nkpts,nocc,nvir,nI,nkpts,nvir)
         for kc in range(nkpts):
-            # (I a|j c): q = k_j - k_c, one product per k_j for all k_a
+            # (I a|j c): q = k_j - k_c, one product per k_j for all k_a, rows (j c)
             for kj in range(nkpts):
-                t_ac[:,kj] = lib.einsum('LkIa,Ljc->Ijkac', IaL[kconserv[kj,kc,0]], Lov[kj,kc])
-            # (I c|j a): q = k_j - k_a, one product per q for all k_j (and k_a = k_j - q)
+                jcL = Lov[kj,kc].reshape(-1,nocc*nvir)
+                lib.dot(jcL.T, IaL[kconserv[kj,kc,0]], c=U_ac[kj].reshape(nocc*nvir,nI*nkv))
+            # (I c|j a): q = k_j - k_a, one product per q for all k_j (and k_a = k_j - q),
+            # rows (I c)
             for q in range(nkpts):
-                t_ca[:,kjs,:,:,kconserv[kjs,q,0]] = lib.einsum('LIc,Lkja->kIjca',
-                                                               IaL[q][:,kc], jaL[q])
-            # amplitudes in place
-            tac = _make_t2(eris, t_ac.reshape(nI,nko,nkv,nvir),
-                           lib.direct_sum('I+j-a-c->Ijac', eIv, eov, evv, ev[kc]))
-            tca = _make_t2(eris, t_ca.reshape(nI,nko,nvir,nkv),
-                           lib.direct_sum('I+j-c-a->Ijca', eIv, eov, ev[kc], evv))
+                IcL = np.ascontiguousarray(IaL[q].reshape(-1,nI,nkpts,nvir)[:,:,kc])
+                Icja = lib.dot(IcL.reshape(-1,nI*nvir).T, jaL[q])
+                Icja = Icja.reshape(nI,nvir,nkpts,nocc,nvir)
+                U_ca6[kjs,:,:,:,kconserv[kjs,q,0]] = Icja.transpose(2,3,1,0,4)
+            Icja = None
+            # conjugated amplitudes in place, (Ia|jc) / (e_I + e_j - e_a - e_c)
+            for kj in range(nkpts):
+                ejcIa = lib.direct_sum('j-c+I-a->jcIa', eo[kj], ev[kc], eIv, evv)
+                _make_t2(eris, U_ac[kj], ejcIa, conj=False)
+                _make_t2(eris, U_ca[kj], ejcIa, conj=False)
+            ejcIa = None
             if with_vir:
-                x = 2*tac - tca.transpose(0,1,3,2)
-                dmvv += lib.einsum('Ijac,Ijbc->ab', tac, x.conj())
-                x = 2*tca - tac.transpose(0,1,3,2)
-                dmvv += lib.einsum('Ijca,Ijcb->ab', tca, x.conj())
+                Uac = U_ac.reshape(-1,nkv)
+                Uca = U_ca.reshape(-1,nkv)
+                _zdot_hn(Uac, Uac, 2, dmvv)
+                _zdot_hn(Uca, Uca, 2, dmvv)
+                _zdot_hn(Uac, Uca, 1, dmvvx)
             if with_occ:
-                x = 2*tca.transpose(0,1,3,2) - 4*tac
-                dmoo += lib.einsum('Kiac,Kjac->ij', tac.conj(), x)
-            x = tac = tca = None
-        t_ac = t_ca = IaL = None
+                Uac = U_ac.reshape(nko,-1)
+                Uca = U_ca.reshape(nko,-1)
+                _zdot_nh(Uac, Uca, 2, dmoo)
+                _zdot_nh(Uac, Uac, -4, dmoo)
+            Uac = Uca = None
+        U_ac = U_ca = U_ca6 = IaL = None
     jaL = None
 
     # Bloch -> supercell canonical orbitals
     if with_occ:
         dmoo = _check_dm_imag(eris, reduce(np.dot, (eris.Wocc.T.conj(), dmoo, eris.Wocc)))
     if with_vir:
+        dmvv -= dmvvx
+        dmvv -= dmvvx.T.conj()
+        dmvvx = None
         dmvv = _check_dm_imag(eris, reduce(np.dot, (eris.Wvir.T.conj(), dmvv, eris.Wvir)))
     return dmoo, dmvv
 
@@ -1261,11 +1316,17 @@ def make_lo_rdm1_1p_k(eris, u, with_occ=True, with_vir=True):
         of one momentum transfer q = k_A - k_i = k_k - k_b only.
 
         Both density matrices are sums over k, so the amplitudes are made for a block of A
-        and one k_k at a time, as the slabs
-            t_ik = t2(i k A b),  t_ki = t2(k i A b)     (k in k_k; i, b in all k)
-        which hold every amplitude the density matrices need for those k. Each amplitude is
-        thus made twice (in t_ik of k_k and in t_ki of k_i), but no amplitude array is
-        larger than (nA, Nk*nocc, nocc, Nk*nvir).
+        and one k_k at a time, as the slabs of conjugated amplitudes
+            P(i A k b) = t2(i k A b).conj(),  Q(i A k b) = t2(k i A b).conj()
+            (k in k_k; i, b in all k)
+        which hold every amplitude the density matrices need for those k. Each term is a
+        matrix product of the slabs, as matrices of rows i and columns (A k b), or of rows
+        (i A k) and columns b:
+            dm(i,j) += P Q^H + Q P^H - 2 P P^H - 2 Q Q^H
+            dm(a,b) += 4 P^H P - 2 P^H Q
+        P is made by one matrix product per (k_b, k), Q by one per q, in rows (k A), copied
+        into place. Each amplitude is thus made twice (in P of k_k and in Q of k_i), but no
+        amplitude array is larger than (Nk*nocc, nA, nocc, Nk*nvir).
 
         Args:
             eris : _KLNODFKERIS
@@ -1293,65 +1354,92 @@ def make_lo_rdm1_1p_k(eris, u, with_occ=True, with_vir=True):
     cA = cA.reshape(nkpts,nvir,-1)
     nVir = eA.size
 
-    # determine Virblksize: per A, the (i A|L) of all q and ~7 slabs (t_ik, t_ki,
-    # denominators, temporaries); fixed, the density matrices and ibL
+    # determine Virblksize: per A, the (i A|L) of all q and ~3 slabs (P, Q, the products of
+    # one q and the denominators); fixed, the density matrices and ibL
     mem_avail = eris.max_memory - lib.current_memory()[0]
-    mem_fix = (nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
-    mem_A = (nkpts*naux*nko + 7*nko*nocc*nkv) * dsize/1e6
+    mem_fix = (2*nko**2*with_occ + nkv**2*with_vir + nkpts*naux*nko*nvir) * dsize/1e6
+    mem_A = (nkpts*naux*nko + 3*nko*nocc*nkv) * dsize/1e6
     Virblksize = max(1, min(nVir, int(np.floor((mem_avail*0.7 - mem_fix) / mem_A))))
     if DEBUG_BLKSIZE: Virblksize = max(1,nVir//2)
     logger.debug1(eris, 'make_lo_rdm1_1p_k :  nkpts = %d  nocc = %d  nvir = %d  nVir = %d  '
                   'naux = %d  Virblksize = %d  peak mem = %.2f MB', nkpts, nocc, nvir, nVir,
                   naux, Virblksize, mem_fix + Virblksize*mem_A)
 
-    # ibL[q] = (i b|L) of all k_i, with k_b = k_i - q: (naux_q, Nk, nocc, nvir)
+    # ibL[q] = (i b|L) of all k_i, with k_b = k_i - q: (naux_q, Nk*nocc*nvir)
     kis = np.arange(nkpts)
-    ibL = [np.stack([Lov[ki,kconserv[ki,q,0]] for ki in kis], axis=1) for q in range(nkpts)]
+    ibL = [np.stack([Lov[ki,kconserv[ki,q,0]] for ki in kis], axis=1).reshape(-1,nko*nvir)
+           for q in range(nkpts)]
 
     dmoo = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None
     dmvv = np.zeros((nkv,nkv), dtype=COMPLEX) if with_vir else None
-    eov, evv = eo.ravel(), ev.ravel()
+    dmoox = np.zeros((nko,nko), dtype=COMPLEX) if with_occ else None   # \sum P Q^H
+    evv = ev.ravel()
     for A0,A1 in lib.prange(0,nVir,Virblksize):
         nA = A1 - A0
         eAv = eA[A0:A1]
-        # iAL[q] = (i A|L) of all k_i, with k_A = k_i + q: (naux_q, Nk, nocc, nA)
+        # iAL[q] = (i A|L) of all k_i, with k_A = k_i + q: (naux_q, Nk*nocc*nA)
         iAL = [np.stack([lib.einsum('Lia,aA->LiA', Lov[ki,kconserv[ki,0,q]],
                                     cA[kconserv[ki,0,q],:,A0:A1])
-                         for ki in kis], axis=1) for q in range(nkpts)]
-        t_ik = np.empty((nA,nkpts,nocc,nocc,nkpts,nvir), dtype=COMPLEX)
-        t_ki = np.empty((nA,nocc,nkpts,nocc,nkpts,nvir), dtype=COMPLEX)
+                         for ki in kis], axis=1).reshape(-1,nko*nA) for q in range(nkpts)]
+        P = np.empty((nkpts,nocc,nA,nocc,nkv), dtype=COMPLEX)
+        Q = np.empty((nkpts,nocc,nA,nocc,nkv), dtype=COMPLEX)
+        P2 = P.reshape(nko*nA,nocc*nkv)
+        Q6 = Q.reshape(nkpts,nocc,nA,nocc,nkpts,nvir)
         for kk in range(nkpts):
-            # (i A|k b): q = k_k - k_b, one product per k_b for all k_i
+            # (i A|k b): q = k_k - k_b, one product per (k_b, k) for all k_i, rows (i A),
+            # written in the columns (k, k_b) of P
             for kb in range(nkpts):
-                t_ik[:,:,:,:,kb] = lib.einsum('LmiA,Lkb->Amikb', iAL[kconserv[kk,kb,0]],
-                                              Lov[kk,kb])
-            # (k A|i b): q = k_i - k_b, one product per q for all k_i (and k_b = k_i - q)
+                iAq = iAL[kconserv[kk,kb,0]]
+                kbL = np.asarray(Lov[kk,kb], dtype=COMPLEX, order='C').reshape(-1,nocc*nvir)
+                for k in range(nocc):
+                    _zgemm('T', 'N', nko*nA, nvir, kbL.shape[0], iAq, kbL, P2, 1, 0,
+                           offsetb=k*nvir, offsetc=k*nkv+kb*nvir)
+            # (k A|i b): q = k_i - k_b, one product per q for all k_i (and k_b = k_i - q),
+            # rows (k A)
             for q in range(nkpts):
-                t_ki[:,:,kis,:,kconserv[kis,q,0]] = lib.einsum('LkA,Lmib->mAkib',
-                                                               iAL[q][:,kk], ibL[q])
-            # amplitudes in place
-            tik = _make_t2(eris, t_ik.reshape(nA,nko,nocc,nkv),
-                           lib.direct_sum('i+k-A-b->Aikb', eov, eo[kk], eAv, evv))
-            tki = _make_t2(eris, t_ki.reshape(nA,nocc,nko,nkv),
-                           lib.direct_sum('k+i-A-b->Akib', eo[kk], eov, eAv, evv))
+                kAL = iAL[q].reshape(-1,nkpts,nocc*nA)[:,kk]
+                kAib = lib.dot(np.ascontiguousarray(kAL).T, ibL[q])
+                Q6[kis,:,:,:,kconserv[kis,q,0]] = kAib.reshape(nocc,nA,nkpts,nocc,nvir
+                                                               ).transpose(2,3,1,0,4)
+            kAib = None
+            # conjugated amplitudes in place, (iA|kb) / (e_i + e_k - e_A - e_b)
+            for ki in range(nkpts):
+                eiAkb = lib.direct_sum('i-A+k-b->iAkb', eo[ki], eAv, eo[kk], evv)
+                _make_t2(eris, P[ki], eiAkb, conj=False)
+                _make_t2(eris, Q[ki], eiAkb, conj=False)
+            eiAkb = None
             if with_occ:
-                x = tki.transpose(0,2,1,3) - 2*tik
-                dmoo += lib.einsum('Aikb,Ajkb->ij', tik.conj(), x)
-                x = tik.transpose(0,2,1,3) - 2*tki
-                dmoo += lib.einsum('Akib,Akjb->ij', tki.conj(), x)
+                Pr = P.reshape(nko,-1)
+                Qr = Q.reshape(nko,-1)
+                _zdot_nh(Pr, Pr, -2, dmoo)
+                _zdot_nh(Qr, Qr, -2, dmoo)
+                _zdot_nh(Pr, Qr, 1, dmoox)
             if with_vir:
-                x = 4*tik - 2*tki.transpose(0,2,1,3)
-                dmvv += lib.einsum('Aika,Aikb->ab', tik, x.conj())
-            x = tik = tki = None
-        t_ik = t_ki = iAL = None
+                Pv = P.reshape(-1,nkv)
+                Qv = Q.reshape(-1,nkv)
+                _zdot_hn(Pv, Pv, 4, dmvv)
+                _zdot_hn(Pv, Qv, -2, dmvv)
+            Pr = Qr = Pv = Qv = None
+        P = Q = P2 = Q6 = iAL = None
     ibL = None
 
     # Bloch -> supercell canonical orbitals
     if with_occ:
+        dmoo += dmoox
+        dmoo += dmoox.T.conj()
+        dmoox = None
         dmoo = _check_dm_imag(eris, reduce(np.dot, (eris.Wocc.T.conj(), dmoo, eris.Wocc)))
     if with_vir:
         dmvv = _check_dm_imag(eris, reduce(np.dot, (eris.Wvir.T.conj(), dmvv, eris.Wvir)))
     return dmoo, dmvv
+
+def _zdot_hn(a, b, alpha, c):
+    r''' c += alpha * a^H b, for C-contiguous complex matrices '''
+    return _zgemm('C', 'N', a.shape[1], b.shape[1], a.shape[0], a, b, c, alpha, 1)
+
+def _zdot_nh(a, b, alpha, c):
+    r''' c += alpha * a b^H, for C-contiguous complex matrices '''
+    return _zgemm('N', 'C', a.shape[0], b.shape[0], a.shape[1], a, b, c, alpha, 1)
 
 def _check_dm_imag(eris, dm):
     if eris.dtype_eri == np.float64:
