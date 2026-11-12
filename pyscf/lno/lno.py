@@ -30,6 +30,7 @@
 
 import os
 import sys
+import json
 import numbers
 from collections.abc import Iterable
 from functools import reduce
@@ -252,6 +253,12 @@ def _same_orbloc(orbloc1, orbloc2):
     if isinstance(orbloc2, (list, tuple)):    # Unrestricted
         return all(_same_orbloc(x1, x2) for x1,x2 in zip(orbloc1, orbloc2))
     return np.shape(orbloc1) == np.shape(orbloc2) and np.allclose(orbloc1, orbloc2, atol=1e-8)
+
+def _lolist_dumps(frag_lolist):
+    r''' `frag_lolist` (nested lists of LO indices, any int types; per fragment a pair of
+    lists for ULNO) as a JSON string, the form it is saved in the chkfile.
+    '''
+    return json.dumps(frag_lolist, default=lambda x: x.tolist())
 
 def _release_eris(eris):
     r''' Free the full-system integrals used to build the LNOs. Any HDF5 file backing an
@@ -496,8 +503,13 @@ class LNO(lib.StreamObject):
         self.delete_full_eris = False
 
         # checkpoint and restart
-        #   chkfile    : the energies of each fragment are saved as its impurity problem
-        #                is solved, and (if save_lno) its LOs and LNOs as they are built.
+        #   chkfile    : the LOs (`lo_coeff`) and the fragments (`frag_lolist`) are saved
+        #                when `kernel` starts, the energies of each fragment as its impurity
+        #                problem is solved, and (if save_lno) its LOs and LNOs as they are
+        #                built. `load_chk` restores the LOs and fragments, so a restart uses
+        #                those its stored fragments were built from, and a calculation can be
+        #                restarted from its chkfile alone, e.g.
+        #                    LNOCCSD_T(mf, None, None).load_chk(chkfile).kernel()
         #                As for SCF, the default file is removed with the object; assign
         #                a filename to keep it.
         #   save_lno   : whether to save the LNOs to the chkfile (they can be large)
@@ -959,6 +971,9 @@ class LNO(lib.StreamObject):
                                              lno_vir=frag_lno[ifrag]['lno_vir']))
                 self._chk_dump_frag(ifrag, 'energy', frag_eners[ifrag])
         lib.chkfile.dump(chkfile, 'lno/nfrag', len(frag_lolist))
+        # the LOs and the fragments made of them, always: a restart must use these
+        lib.chkfile.dump(chkfile, 'lno/lo_coeff', lo_coeff)
+        lib.chkfile.dump(chkfile, 'lno/frag_lolist', _lolist_dumps(frag_lolist))
 
     def _chk_dump_frag(self, ifrag, key, value):
         if self.chkfile and value is not None:
@@ -973,21 +988,49 @@ class LNO(lib.StreamObject):
     def load_chk(self, chkfile=None):
         r''' Restart from a chkfile written by `kernel` (default: `self.chkfile`).
 
-        Sets `frag_lno` and `frag_eners` from the LNOs and energies of the fragments that
+        Sets `lo_coeff` and `frag_lolist` to the LOs and fragments saved in the chkfile (those
+        the stored fragments were built from, which replace any given, so both may be None),
+        `frag_lno` and `frag_eners` from the LNOs and energies of the fragments that
         finished, and the full-system energies (`e_corr_rpa_full`, `e_corr_sosex_full`)
-        that were computed, so that the next `kernel` call only
-        computes what is missing. If `self.chkfile` is the same file, the run continues
-        writing to it.
+        that were computed, so that the next `kernel` call only computes what is missing.
+        If `self.chkfile` is the same file, the run continues writing to it.
         '''
         if chkfile is None: chkfile = self.chkfile
         dat = lib.chkfile.load(chkfile, 'lno')
         if dat is None:
             raise KeyError('No LNO data in chkfile %s' % chkfile)
+        frag_lolist = dat.get('frag_lolist')
+        if frag_lolist is None:
+            if self.frag_lolist is None:
+                raise KeyError('chkfile %s has no fragments (written before they were saved); '
+                               'pass frag_lolist' % chkfile)
+        else:
+            frag_lolist = json.loads(frag_lolist)
+            if (self.frag_lolist is not None and
+                    json.loads(_lolist_dumps(self.frag_lolist)) != frag_lolist):
+                logger.info(self, 'Using the fragments saved in chkfile %s instead of those '
+                            'given.', chkfile)
+            self.frag_lolist = frag_lolist
         nfrag = int(dat['nfrag'])
         if nfrag != self.nfrag:
             logger.error(self, 'chkfile %s has %d fragments (expecting %d).',
                          chkfile, nfrag, self.nfrag)
             raise ValueError
+        lo_coeff = dat.get('lo_coeff')
+        if lo_coeff is None:
+            if self.lo_coeff is None:
+                raise KeyError('chkfile %s has no LOs (written before they were saved); '
+                               'pass lo_coeff' % chkfile)
+            logger.warn(self, 'chkfile %s has no LOs (written before they were saved): the '
+                        'fragments restored from it are assumed to come from the LOs given.',
+                        chkfile)
+        else:
+            if isinstance(lo_coeff, (list, tuple)):   # Unrestricted
+                lo_coeff = [np.asarray(x) for x in lo_coeff]
+            if self.lo_coeff is not None and not _same_orbloc(lo_coeff, self.lo_coeff):
+                logger.info(self, 'Using the LOs saved in chkfile %s instead of those given.',
+                            chkfile)
+            self.lo_coeff = lo_coeff
         self.frag_lno = [None] * nfrag
         self.frag_eners = [None] * nfrag
         for ifrag in range(nfrag):

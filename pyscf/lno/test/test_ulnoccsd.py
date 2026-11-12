@@ -15,6 +15,7 @@
 #
 
 import unittest
+import json
 import numpy as np
 from pyscf import gto, scf, mp, cc, lo
 from pyscf.cc.uccsd_t import kernel as CCSD_T
@@ -156,8 +157,8 @@ class WaterDimer(unittest.TestCase):
         lo_coeff, frag_lolist = self._pm_lo_frag()
         nfrag = len(frag_lolist)
         nfraga = sum(len(f[0]) > 0 for f in frag_lolist)
-        def make():
-            mcc = ULNOCCSD_T(self.mf, lo_coeff, frag_lolist, frozen=self.frozen).set(verbose=5)
+        def make(lo=lo_coeff, frags=frag_lolist):
+            mcc = ULNOCCSD_T(self.mf, lo, frags, frozen=self.frozen).set(verbose=5)
             mcc.lno_thresh = [2e-4,2e-5]
             return mcc
 
@@ -167,7 +168,14 @@ class WaterDimer(unittest.TestCase):
         self.assertEqual(calls, {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
         self.assertAlmostEqual(m1.e_corr_ccsd_t, ref[2], 6)
 
-        m2 = make().load_chk(m1.chkfile)
+        # restart from the chkfile alone: the per-spin LOs and the fragments (pairs of
+        # per-spin LO lists, some empty) are saved and restored
+        m2 = make(None, None).load_chk(m1.chkfile)
+        self.assertIsInstance(m2.lo_coeff, list)
+        for s in range(2):
+            self.assertAlmostEqual(abs(m2.lo_coeff[s] - lo_coeff[s]).max(), 0, 14)
+        self.assertEqual(m2.frag_lolist,
+                         json.loads(json.dumps(frag_lolist, default=lambda x: x.tolist())))
         for i in range(nfraga):
             m2.frag_eners[i] = None
         m2.frag_lno[-1] = m2.frag_eners[-1] = None

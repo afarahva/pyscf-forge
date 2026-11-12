@@ -284,7 +284,11 @@ class ShiftedKmesh(unittest.TestCase):
         self.assertAlmostEqual(m1.e_corr_ccsd_t, ref[2], 8)
 
         def restart(mcc):
+            # restart from the chkfile alone: m1's supercell LOs and fragments are restored
+            mcc.lo_coeff = mcc.frag_lolist = None
             mcc.load_chk(m1.chkfile)
+            self.assertAlmostEqual(abs(mcc.lo_coeff - m1.lo_coeff).max(), 0, 14)
+            self.assertEqual(mcc.frag_lolist, [list(map(int, f)) for f in m1.frag_lolist])
             mcc.frag_eners[0] = None
             mcc.frag_lno[1] = mcc.frag_eners[1] = None
             calls.append(kernel_counted(mcc))

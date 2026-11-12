@@ -15,7 +15,10 @@
 #
 
 import unittest
+import json
 import numpy as np
+import h5py
+from pyscf import lib
 from pyscf import __config__
 setattr(__config__, 'lnocc_DEBUG_BLKSIZE', True)    # debug outcore mode
 from pyscf import gto, scf, mp, cc, lo
@@ -210,19 +213,26 @@ class WaterDimer(unittest.TestCase):
         nfrag = len(frag_lolist)
 
         ref = [-0.4054784012,-0.4240686326,-0.4303996712]
-        def make(cls):
-            mcc = cls(mf, lo_coeff, frag_lolist, frozen=frozen).set(verbose=5)
+        def make(cls, lo=lo_coeff, frags=frag_lolist):
+            mcc = cls(mf, lo, frags, frozen=frozen).set(verbose=5)
             mcc.lno_thresh = [1e-4,1e-5]
             return mcc
+        frags_plain = json.loads(json.dumps(frag_lolist, default=lambda x: x.tolist()))
 
         m1 = make(LNOCCSD)
         calls = kernel_counted(m1)
         self.assertEqual(calls, {'ao2mo': 1, 'make_las': nfrag, 'impurity_solve': nfrag})
         self.assertAlmostEqual(m1.e_corr_pt2, ref[0], 6)
         self.assertAlmostEqual(m1.e_corr_ccsd, ref[1], 6)
+        # the LOs and the fragments are always saved
+        self.assertAlmostEqual(abs(lib.chkfile.load(m1.chkfile, 'lno/lo_coeff') - lo_coeff).max(),
+                               0, 14)
+        self.assertEqual(json.loads(lib.chkfile.load(m1.chkfile, 'lno/frag_lolist')), frags_plain)
 
-        # the (T) energies are missing: all impurity problems redone with the saved LNOs
-        m2 = make(LNOCCSD_T).load_chk(m1.chkfile)
+        # the (T) energies are missing: all impurity problems redone with the saved LNOs.
+        # m2 is given other LOs (reversed order): load_chk restores the saved ones
+        m2 = make(LNOCCSD_T, lo_coeff[:,::-1].copy()).load_chk(m1.chkfile)
+        self.assertAlmostEqual(abs(m2.lo_coeff - lo_coeff).max(), 0, 14)
         calls = kernel_counted(m2)
         self.assertEqual(calls, {'ao2mo': 0, 'make_las': 0, 'impurity_solve': nfrag})
         self.assertAlmostEqual(m2.e_corr_pt2, m1.e_corr_pt2, 9)
@@ -243,11 +253,30 @@ class WaterDimer(unittest.TestCase):
         for key in ['efrag_pt2', 'efrag_cc', 'efrag_cc_t', 'efrag_cc_spin_comp']:
             self.assertAlmostEqual(abs(getattr(m3, key) - getattr(m2, key)).max(), 0, 9)
 
-        # everything is in the chkfile now
-        m4 = make(LNOCCSD_T).load_chk(m2.chkfile)
+        # everything is in the chkfile now: restart from the chkfile alone (no LOs or
+        # fragments given)
+        m4 = make(LNOCCSD_T, None, None).load_chk(m2.chkfile)
+        self.assertAlmostEqual(abs(m4.lo_coeff - lo_coeff).max(), 0, 14)
+        self.assertEqual(m4.frag_lolist, frags_plain)
         calls = kernel_counted(m4)
         self.assertEqual(calls, {'ao2mo': 0, 'make_las': 0, 'impurity_solve': 0})
         self.assertAlmostEqual(m4.e_corr_ccsd_t, m2.e_corr_ccsd_t, 12)
+
+        # a chkfile without LOs (written before they were saved): the given LOs are kept,
+        # and without any LOs it cannot be restarted
+        with h5py.File(m2.chkfile, 'r+') as f:
+            del f['lno/lo_coeff']
+        lo_given = lo_coeff[:,::-1].copy()
+        m5 = make(LNOCCSD_T, lo_given).load_chk(m2.chkfile)
+        self.assertIs(m5.lo_coeff, lo_given)
+        with self.assertRaises(KeyError):
+            make(LNOCCSD_T, None).load_chk(m2.chkfile)
+        # likewise without fragments
+        with h5py.File(m2.chkfile, 'r+') as f:
+            del f['lno/frag_lolist']
+        self.assertIs(make(LNOCCSD_T).load_chk(m2.chkfile).frag_lolist, frag_lolist)
+        with self.assertRaises(KeyError):
+            make(LNOCCSD_T, lo_coeff, None).load_chk(m2.chkfile)
 
 
 def kernel_counted(mcc):
